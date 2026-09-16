@@ -9,6 +9,7 @@ import sys
 import time
 import uuid
 import base64
+import json as _json
 import asyncio
 import logging
 import threading
@@ -27,7 +28,7 @@ from playwright.async_api import async_playwright
 app = Flask(__name__)
 
 PORT = int(os.environ.get("PORT", 5000))
-HEADLESS = True
+HEADLESS = False
 
 URL_TEMPLATE = "https://www.bing.com/search?FORM=HDRSC1&q={q}"
 
@@ -40,7 +41,6 @@ UA_MOBILE = (
 VIEWPORT = {"width": 412, "height": 915}
 DEVICE_SCALE = 2.625
 
-# Pasta das fotos (servida em /photos/<arquivo>)
 PHOTOS_DIR = Path(os.environ.get("PHOTOS_DIR", "./photos"))
 PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -111,303 +111,401 @@ def ip_do_cliente() -> str:
 
 
 # =============================================================================
-# 3. JS DE EXTRAÇÃO
+# 3. JS — TRÊS ESTRATÉGIAS
+#    1) IA (Markdown)  →  se achar #b_content com bloco de resposta
+#    2) Jogo  (JSON)   →  se achar #b_wpt_container com cards de partidas
+#    3) Página (txt)   →  fallback bruto de toda a página
 # =============================================================================
 
 JS_CAPTURAR = r"""
-async () => {
+() => {
 
-  // ---------------------------------------------------------------------------
-  // 3.1) Copilot — resposta da IA (melhor caso)
-  // ---------------------------------------------------------------------------
-    async function tryCopilot() {
-    const wrapper =
-        document.querySelector('#b_mcw') ||
-        document.querySelector('#copans_container');
-    if (!wrapper) return null;
+  // ===========================================================================
+  // 3.1) IA — Resposta do Copilot convertida em Markdown
+  // ===========================================================================
+  function tryIA() {
+    const content = document.querySelector('#b_content');
+    if (!content) return null;
 
-    const caMain =
-        wrapper.querySelector('#ca_main') ||
-        wrapper.querySelector('.ca_main') ||
-        wrapper;
-    if (!caMain || (caMain.innerText || '').trim().length < 100) return null;
+    const firstItem = content.querySelector(
+      'div[id^="cplt_frame_"], li.b_ans, #ca_main, .answer_container'
+    );
+    if (!firstItem) return null;
 
-    if (caMain.querySelector('.bsp_mgz_schedule, .bsp_mgz_standings, #b_wpt_container')) {
-      return null;
+    // Evita pegar Sports por engano — Sports tem #b_wpt_container
+    if (firstItem.querySelector('#b_wpt_container')) return null;
+
+    let source = firstItem;
+    const iframe = firstItem.querySelector('iframe');
+    if (iframe) {
+      try { source = iframe.contentDocument.body; } catch (e) {}
     }
 
-    // -------------------------------------------------------------------------
-    // FLASH: clica em "Ler tudo" se existir (1 clique rápido, sem loop)
-    // -------------------------------------------------------------------------
-    const lerTudo = Array.from(wrapper.querySelectorAll('button, a, div[role="button"]'))
-      .find(el => {
-        const t = (el.textContent || '').toLowerCase();
-        return (t.includes('ler tudo') || t.includes('read more') || t.includes('ver mais'))
-               && el.offsetParent !== null;
-      });
-
-    if (lerTudo) {
-      try {
-        lerTudo.scrollIntoView({ block: 'center' });
-        lerTudo.click();
-        // 1s pra expandir
-        await new Promise(r => setTimeout(r, 1000));
-      } catch (e) {}
-    }
-
-    // -------------------------------------------------------------------------
-    // Fontes do Copilot (citações reais)
-    // -------------------------------------------------------------------------
-    const fontesCopilot = [];
-    wrapper.querySelectorAll('a[data-url]').forEach(a => {
-      const u = a.getAttribute('data-url');
-      if (u && u.startsWith('http')) fontesCopilot.push(u);
-    });
-
-    // -------------------------------------------------------------------------
-    // Clona e limpa
-    // -------------------------------------------------------------------------
-    const clone = caMain.cloneNode(true);
+    const clone = source.cloneNode(true);
     clone.querySelectorAll([
+      '.md_citlink', 'sup', '.b_cits', '.ca_action_menu', '.b_attribution',
+      '.gs_cit', '.gs_cits', '.gs_cit_wrapper', '.gs_cit_cont',
+      '.gs_cit_panel', '.gs_cit_panel_content', '.gs_cit_panel_header',
+      '.bsp_cit_cont', '.b_genserp_citation_hover_md', '.cit_exp_cont',
+      '.gs_cit_exp', '.gs_cit_exp_text', '.gs_cit_src', '.gs_cit_title',
+      '.gs_cit_snippet', '.gs_cit_siteurl', '.gs_cit_title_text',
+      '.gs_mdlink', '.gs_cit_txt', '.gs_sm_cit', '.gs_sup_cit',
+      '.gs_readMoreFullBtn',
+      '.gs_infobbl', '#gs_infobbl', '.gs_ai_disclaimer',
+      '.gs_secctrl', '.gs_secctrl_items', '.acf_fdbk_ph',
+      'acf-thumbs-up-down-feedback', 'acf-button-standard',
+      '.b_acf_answer_expansion_control', '.b_module_expansion_control',
+      '.b_acf_expansion_gradient_overlay', '.b_btnContainer',
+      '.bsp_seemore', '.mag_st_header',
+      '.b_wpt_header', '.bsp_mgz_header', '.bsp_mgzhdr_btns',
+      '.b_wpt_attr', '.b_wpt_footer', '.b_gs_top_gradient', '.b_gs_bottom_cover',
       'script', 'style', 'noscript', 'iframe',
-      '.b_ad', '.sb_ad', 'footer', '.rms_img',
-      '.gs_infobbl', '#gs_infobbl',
-      '.gs_ai_disclaimer',
-      '.gs_secctrl', '.gs_secctrl_items',
-      'acf-thumbs-up-down-feedback',
-      'acf-button-standard',
-      '.b_acf_answer_expansion_control',
-      '.b_module_expansion_control',
-      '.b_gs_top_gradient', '.b_gs_bottom_cover',
-      '.gs_sm_cit', '.gs_sup_cit',
-      '.gs_mdlink', '.gs_cit_txt',
+      '.b_ad', '.sb_ad',
+      '#b_header', '#b_footer', 'header', 'nav', 'footer',
     ].join(',')).forEach(el => el.remove());
 
-    let texto = (clone.innerText || clone.textContent || '').trim();
+    let markdown = "";
+    clone.querySelectorAll('h1, h2, h3, p, li, br').forEach(el => {
+      let text = el.innerHTML || '';
+      text = text.replace(/<strong[^>]*>(.*?)<\/strong>/gis, '**$1**');
+      text = text.replace(/<b[^>]*>(.*?)<\/b>/gis, '**$1**');
+      text = text.replace(/<em[^>]*>(.*?)<\/em>/gis, '*$1*');
+      text = text.replace(/<i[^>]*>(.*?)<\/i>/gis, '*$1*');
+      text = text.replace(/<[^>]*>/g, '');
+      text = text.replace(/&nbsp;|›|»|&amp;/g, ' ');
+      text = text.replace(/\s+/g, ' ').trim();
+      if (!text) return;
 
-    const lixos = [
-      /Este resumo foi gerado pela IA[^\n]*/gi,
-      /Localize os links de origem[^\n]*/gi,
-      /Saiba mais sobre os resultados[^\n]*/gi,
-      /como o\s+Bing entrega os resultados da pesquisa/gi,
-      /Curtir\s*Não gosto/gi,
-      /Com base em fontes/gi,
-      /^\s*Saiba mais\s*$/gim,
-      /^\s*Ler tudo\s*$/gim,
-      /^\s*Read more\s*$/gim,
-    ];
-    for (const r of lixos) texto = texto.replace(r, '');
+      const tag = el.tagName;
+      if (tag === 'H1') markdown += `# ${text}\n\n`;
+      else if (tag === 'H2') markdown += `## ${text}\n\n`;
+      else if (tag === 'H3') markdown += `### ${text}\n\n`;
+      else if (tag === 'P' || tag === 'BR') markdown += `${text}\n\n`;
+      else if (tag === 'LI') markdown += `* ${text}\n`;
+    });
 
-    texto = texto.split(/Wikipedia\s*›\s*wiki/i)[0].trim();
-    texto = texto.split(/Mostrar tudo\s*Referências/i)[0].trim();
-    texto = texto.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+    markdown = markdown.replace(/\n{3,}/g, '\n\n').trim();
+    if (!markdown || markdown.length < 50) return null;
 
-    const fontesTodas = [];
-    wrapper.querySelectorAll('a').forEach(a => {
-      const h = a.href;
-      if (h && h.startsWith('http') && !h.includes('bing.com')) fontesTodas.push(h);
+    const fontes = [];
+    firstItem.querySelectorAll('a[href^="http"]').forEach(a => {
+      const h = a.getAttribute('href') || '';
+      if (h.startsWith('http') && !h.includes('bing.com')) fontes.push(h);
     });
 
     return {
-      modo: 'copilot',
-      text: texto,
-      fontes: [...new Set(fontesCopilot)],
-      fontes_general: [...new Set(fontesTodas)],
-      jogos: []
+      modo: 'ia',
+      text: markdown,
+      fontes: [...new Set(fontes)],
+      fontes_general: [...new Set(fontes)],
+      jogos: [],
+      estrutura: null
     };
   }
 
-  // ---------------------------------------------------------------------------
-  // 3.2) Sports — tabela de jogos
-  // ---------------------------------------------------------------------------
-  async function trySports() {
-    const ac = document.querySelector('.answer_container');
-    if (!ac) return null;
-    const container = ac.querySelector('#b_wpt_container') || ac;
+  // ===========================================================================
+  // 3.2) JOGO — Arena de Esportes (JSON estruturado)
+  // ===========================================================================
+   function tryJogo() {
+    const container = document.querySelector('#b_wpt_container');
     if (!container) return null;
 
-    const jogos = [];
-    const cards = container.querySelectorAll('.bsp_schedule_mtch_crd .bsp_match_card');
+    const data = {
+      time: (container.querySelector('.b_entityTitle')?.innerText
+          || container.querySelector('.bsp_magazine_title')?.innerText
+          || '').trim() || null,
+      competicao: (container.querySelector('.b_entitySubTitle')?.innerText
+          || container.querySelector('.bsp_subttl')?.innerText
+          || '').trim() || null,
+      partidas: [],
+      classificacao: []
+    };
+
+    // -------------------------------------------------------------------------
+    // 1) PARTIDAS — múltiplos seletores, um card por partida
+    // -------------------------------------------------------------------------
+    const seletoresCards = [
+      '.bsp_schedule_mtch_crd .bsp_match_card',      // layout novo (já funcionava)
+      '.bsp_match_card',                              // genérico
+      '.b_mtcctnr',                                   // container interno
+      '[role="listitem"]',                            // slides
+    ];
+
+    const cardsVistos = new Set();
+    const cards = [];
+
+    for (const sel of seletoresCards) {
+      container.querySelectorAll(sel).forEach(c => {
+        if (!cardsVistos.has(c)) {
+          cardsVistos.add(c);
+          cards.push(c);
+        }
+      });
+    }
 
     cards.forEach(card => {
       try {
-        const compEl = card.querySelector('.bsp_mtc_tps div');
-        const competicao = compEl ? (compEl.getAttribute('title') || compEl.innerText.trim()) : '';
-        const times = card.querySelectorAll('.bsp_team');
-        if (times.length < 2) return;
-        const time_casa = (times[0].querySelector('.team-name-ellipsis')?.innerText || '').trim();
-        const time_fora = (times[1].querySelector('.team-name-ellipsis')?.innerText || '').trim();
-        const scores = card.querySelectorAll('.bsp_team_scr');
+        // Time da casa — múltiplos seletores
+        const timeCasaEl = card.querySelector('.bsp_team:first-of-type .team-name-ellipsis')
+                       || card.querySelectorAll('.bsp_team')[0]?.querySelector('.team-name-ellipsis')
+                       || card.querySelectorAll('.bsp-team-name .team-name-ellipsis')[0];
+        const timeForaEl = card.querySelector('.bsp_team:last-of-type .team-name-ellipsis')
+                       || card.querySelectorAll('.bsp_team')[1]?.querySelector('.team-name-ellipsis')
+                       || card.querySelectorAll('.bsp-team-name .team-name-ellipsis')[1];
+
+        const time_casa = (timeCasaEl?.innerText || '').trim();
+        const time_fora = (timeForaEl?.innerText || '').trim();
+
+        // Placar
+        const scores = card.querySelectorAll('.bsp_team_scr, .bsp_mag_score > div');
         const placar_casa = scores[0] ? scores[0].innerText.trim() : '';
         const placar_fora = scores[1] ? scores[1].innerText.trim() : '';
-        const status = (card.querySelector('.game-info > div:first-child')?.innerText || '').trim();
-        const data = (card.querySelector('.game-time')?.innerText || '').trim();
-        jogos.push({
-          competicao, time_casa, time_fora,
-          placar: `${placar_casa} - ${placar_fora}`,
-          status, data, horario: 'N/A'
-        });
+
+        // Competição
+        const compEl = card.querySelector('.bsp_mtc_tps div')
+                    || card.querySelector('[title*="·"]');
+        const torneio = compEl
+          ? (compEl.getAttribute('title') || compEl.innerText.trim())
+          : '';
+
+        // Status / data
+        const status = (card.querySelector('.bsp_game_info > div:first-child')?.innerText
+                    || card.querySelector('.game-info > div:first-child')?.innerText
+                    || '').trim();
+        const data_jogo = (card.querySelector('.bsp_game_time')?.innerText
+                       || card.querySelector('.game-time')?.innerText
+                       || '').trim();
+
+        // Só adiciona se tem pelo menos time_casa e time_fora
+        if (time_casa && time_fora) {
+          data.partidas.push({
+            torneio,
+            time_casa,
+            time_fora,
+            placar: `${placar_casa} x ${placar_fora}`,
+            status,
+            data: data_jogo,
+            horario: 'N/A'
+          });
+        } else {
+          // Fallback: parsing por linhas (o jeito antigo)
+          const linhas = card.innerText.split('\n')
+            .map(l => l.trim()).filter(l => l.length > 0);
+          for (let i = 0; i < linhas.length; i++) {
+            if (linhas[i] && linhas[i+1] && linhas[i+2]
+                && linhas[i+3] !== undefined && linhas[i+4] !== undefined) {
+              data.partidas.push({
+                torneio: linhas[i],
+                time_casa: linhas[i+1],
+                time_fora: linhas[i+2],
+                placar: `${linhas[i+3]} x ${linhas[i+4]}`,
+                status: linhas[i+5] || '',
+                data: linhas[i+6] || '',
+                horario: 'N/A'
+              });
+              i += 6;
+            }
+          }
+        }
       } catch (e) {}
     });
 
-    if (jogos.length === 0) return null;
-    return { modo: 'sports', text: container.innerText.trim(), fontes: [], fontes_general: [], jogos };
+    // Dedup por (time_casa + time_fora + placar)
+    const unicos = new Set();
+    data.partidas = data.partidas.filter(p => {
+      const k = `${p.time_casa}|${p.time_fora}|${p.placar}`;
+      if (unicos.has(k)) return false;
+      unicos.add(k);
+      return true;
+    });
+
+    // -------------------------------------------------------------------------
+    // 2) CLASSIFICAÇÃO — múltiplos seletores
+    // -------------------------------------------------------------------------
+    const seletoresClass = [
+      '.bsp_mgz_standings .bsp_row_item',   // layout novo
+      '.bsp_std_list tr',
+      '.b_snippet li',
+      'tr',
+    ];
+
+    const rowsVistas = new Set();
+    const rows = [];
+
+    for (const sel of seletoresClass) {
+      container.querySelectorAll(sel).forEach(r => {
+        if (!rowsVistas.has(r)) {
+          rowsVistas.add(r);
+          rows.push(r);
+        }
+      });
+    }
+
+    rows.forEach(row => {
+      try {
+        // Modo A: estrutura com classes
+        const posEl = row.querySelector('.bsp_row_rank');
+        const timeEl = row.querySelector('.bsp_row_teamname, .team-name-ellipsis');
+        const ptsEl = row.querySelector('.bsp_col_pts');
+
+        if (posEl && timeEl && ptsEl) {
+          const posicao = posEl.innerText.trim();
+          const time = timeEl.getAttribute('title') || timeEl.innerText.trim();
+          const pontos = ptsEl.innerText.replace(/PTS/gi, '').trim();
+          if (posicao && time) {
+            data.classificacao.push({ posicao, time, pontos });
+            return;
+          }
+        }
+
+        // Modo B: parsing por texto
+        const text = row.innerText.split('\n').map(t => t.trim()).filter(t => t.length > 0);
+        if (text.length >= 3 && !isNaN(text[0])) {
+          data.classificacao.push({
+            posicao: text[0],
+            time: text[1],
+            pontos: text[text.length - 1]
+          });
+        }
+      } catch (e) {}
+    });
+
+    // Dedup por posição
+    const posVistas = new Set();
+    data.classificacao = data.classificacao.filter(c => {
+      if (posVistas.has(c.posicao)) return false;
+      posVistas.add(c.posicao);
+      return true;
+    });
+
+    // -------------------------------------------------------------------------
+    // 3) VALIDAÇÃO — só retorna se achou algo
+    // -------------------------------------------------------------------------
+    if (data.partidas.length === 0 && data.classificacao.length === 0) return null;
+
+    // Texto plano (fallback legível)
+    const linhas = [];
+    if (data.time) linhas.push(`# ${data.time}`);
+    if (data.competicao) linhas.push(`_${data.competicao}_`);
+    linhas.push('');
+
+    if (data.partidas.length) {
+      linhas.push('## Partidas');
+      data.partidas.forEach(p => {
+        linhas.push(`- ${p.torneio}: ${p.time_casa} ${p.placar} ${p.time_fora} (${p.status}, ${p.data})`);
+      });
+      linhas.push('');
+    }
+
+    if (data.classificacao.length) {
+      linhas.push('## Classificação');
+      data.classificacao.forEach(c => {
+        linhas.push(`- ${c.posicao}º ${c.time}: ${c.pontos} pts`);
+      });
+    }
+
+    return {
+      modo: 'jogo',
+      text: linhas.join('\n').trim(),
+      fontes: [],
+      fontes_general: [],
+      jogos: data.partidas,
+      estrutura: data
+    };
   }
 
-  // ---------------------------------------------------------------------------
-  // 3.3) Página inteira — LIMPEZA AGRESSIVA
-  //     (remove cards de fonte, links citados, botões, tudo que é estrutura)
-  // ---------------------------------------------------------------------------
-  async function tryWholePage() {
-    // Tenta partir do container mais "limpo" disponível
+  // ===========================================================================
+  // 3.3) PÁGINA — fallback bruto (texto puro, sem links)
+  // ===========================================================================
+  function tryPagina() {
     const root =
-      document.querySelector('#ca_main') ||
       document.querySelector('#b_content main') ||
       document.querySelector('#b_content') ||
       document.body;
 
     const clone = root.cloneNode(true);
-
-    // -------------------------------------------------------------------------
-    // 3.3.1) REMOÇÃO ESTRUTURAL
-    // Remove blocos inteiros que são lixo (cards, botões, cabeçalhos, etc.)
-    // -------------------------------------------------------------------------
     clone.querySelectorAll([
-      // Lixo básico
       'script', 'style', 'noscript', 'iframe', 'svg', 'head', 'meta',
       'link', 'template', 'object', 'embed', 'canvas',
       '.b_ad', '.sb_ad', '.b_adTop', '.b_adBottom',
       '.rms_img', 'img', 'video', 'audio',
       '#b_header', '#b_footer', 'header', 'nav', 'footer',
       '.b_hide', '[aria-hidden="true"]',
-
-      // Cards de fonte (contêm os textos "Wikipedia › wiki › Nobru", "forbes.com.br" etc.)
       '.gs_cit', '.gs_cits', '.gs_cit_wrapper', '.gs_cit_cont',
-      '.gs_cit_panel', '.gs_cit_panel_content', '.gs_cit_panel_header',
-      '.bsp_cit_cont', '.b_genserp_citation_hover_md', '.cit_exp_cont',
-      '.gs_cit_exp', '.gs_cit_exp_text', '.gs_cit_src', '.gs_cit_title',
-      '.gs_cit_snippet', '.gs_cit_siteurl', '.gs_cit_title_text',
-
-      // Links citados inline no texto (Wikipedia+1, Esports.net, etc.)
+      '.gs_cit_panel', '.bsp_cit_cont', '.b_genserp_citation_hover_md',
       '.gs_mdlink', '.gs_cit_txt', '.gs_sm_cit', '.gs_sup_cit',
-
-      // Botões e feedback
+      '.gs_readMoreFullBtn',
       'acf-button-standard', 'acf-thumbs-up-down-feedback',
       '.gs_secctrl', '.gs_secctrl_items', '.acf_fdbk_ph',
       '.b_acf_answer_expansion_control', '.b_module_expansion_control',
-      '.b_acf_expansion_gradient_overlay', '.b_btnContainer',
-
-      // Avisos IA e disclaimers
       '.gs_ai_disclaimer', '.gs_infobbl', '#gs_infobbl',
-
-      // Cabeçalhos de bloco e "ver mais"
-      '.bsp_seemore', '.bsp_seemore_start', '.bsp_seemore_cta',
-      '.mag_st_header', '.mag_header',
-      '.b_wpt_header', '.bsp_mgz_header', '.bsp_mgzhdr_btns',
-
-      // Rodapés do Copilot
+      '.bsp_seemore', '.mag_st_header', '.b_wpt_header',
+      '.bsp_mgz_header', '.bsp_mgzhdr_btns',
       '.b_wpt_attr', '.b_wpt_footer', '.b_gs_top_gradient', '.b_gs_bottom_cover',
     ].join(',')).forEach(el => el.remove());
 
-    // -------------------------------------------------------------------------
-    // 3.3.2) REMOÇÃO DE LINKS (mantém só o texto)
-    // Substitui cada <a> pelo seu texto puro
-    // -------------------------------------------------------------------------
-    clone.querySelectorAll('a').forEach(a => {
-      const t = (a.innerText || a.textContent || '').trim();
-      a.replaceWith(document.createTextNode(t));
+    let markdown = "";
+    clone.querySelectorAll('h1, h2, h3, p, li').forEach(el => {
+      let text = el.innerHTML || '';
+      text = text.replace(/<strong[^>]*>(.*?)<\/strong>/gis, '**$1**');
+      text = text.replace(/<b[^>]*>(.*?)<\/b>/gis, '**$1**');
+      text = text.replace(/<em[^>]*>(.*?)<\/em>/gis, '*$1*');
+      text = text.replace(/<i[^>]*>(.*?)<\/i>/gis, '*$1*');
+      text = text.replace(/<[^>]*>/g, '');
+      text = text.replace(/&nbsp;|›|»|&amp;/g, ' ');
+      text = text.replace(/\s+/g, ' ').trim();
+      if (!text) return;
+
+      const tag = el.tagName;
+      if (tag === 'H1') markdown += `# ${text}\n\n`;
+      else if (tag === 'H2') markdown += `## ${text}\n\n`;
+      else if (tag === 'H3') markdown += `### ${text}\n\n`;
+      else if (tag === 'P') markdown += `${text}\n\n`;
+      else if (tag === 'LI') markdown += `* ${text}\n`;
     });
 
-    // -------------------------------------------------------------------------
-    // 3.3.3) PEGA O TEXTO PURO
-    // -------------------------------------------------------------------------
-    let texto = (clone.innerText || clone.textContent || '').trim();
-
-    // -------------------------------------------------------------------------
-    // 3.3.4) CORTES ESTRUTURAIS (frases-âncora do rodapé)
-    // -------------------------------------------------------------------------
     const cortes = [
-      /Exibir tudo\s*\d*\s*Fontes/i,
-      /Continuar explorando/i,
-      /Todas as fontes/i,
-      /Mostrar tudo\s*Referências/i,
-      /Nova pesquisa/i,
-      /Experimente a Pesquisa Visual/i,
-      /Referências\s*\d+\s*fonte/i,
-      /Fontes\s*\d+/i,
+      /\nExibir tudo\s*\d*\s*Fontes/i,
+      /\nContinuar explorando/i,
+      /\nTodas as fontes/i,
+      /\nMostrar tudo\s*Referências/i,
+      /\nNova pesquisa/i,
+      /\nExperimente a Pesquisa Visual/i,
     ];
-    for (const c of cortes) {
-      texto = texto.split(c)[0];
-    }
+    for (const c of cortes) markdown = markdown.split(c)[0];
 
-    // -------------------------------------------------------------------------
-    // 3.3.5) LIMPEZA FINA (frases soltas e lixo visual)
-    // -------------------------------------------------------------------------
-    const lixos = [
-      /^\s*Leia mais\s*$/gim,
-      /^\s*Ver mais\s*$/gim,
-      /^\s*Saiba mais\s*$/gim,
-      /^\s*Feedback\s*$/gim,
-      /^\s*Exibir tudo\s*$/gim,
-      /Este resumo foi gerado pela IA[^\n]*/gi,
-      /Localize os links de origem[^\n]*/gi,
-      /Saiba mais sobre os resultados[^\n]*/gi,
-      /Curtir\s*Não gosto/gi,
-      /Com base em fontes/gi,
-    ];
-    for (const r of lixos) texto = texto.replace(r, '');
+    markdown = markdown.replace(/\n{3,}/g, '\n\n').trim();
+    if (markdown.length < 50) return null;
 
-    // -------------------------------------------------------------------------
-    // 3.3.6) HIGIENIZAÇÃO FINAL
-    // Remove linhas em branco duplicadas e normaliza espaços
-    // -------------------------------------------------------------------------
-    texto = texto
-      .split('\n')
-      .map(l => l.replace(/[ \t]+/g, ' ').trim())
-      .filter((l, i, arr) => l.length > 0 || (i > 0 && arr[i - 1].length > 0))
-      .join('\n')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
-
-    if (texto.length < 50) return null;
-
-    // Fontes gerais: pega os links externos ANTES de remover (do root original)
     const fontesTodas = [];
-    root.querySelectorAll('a').forEach(a => {
-      const h = a.href;
-      if (h && h.startsWith('http') && !h.includes('bing.com')) fontesTodas.push(h);
+    root.querySelectorAll('a[href^="http"]').forEach(a => {
+      const h = a.getAttribute('href') || '';
+      if (h.startsWith('http') && !h.includes('bing.com')) fontesTodas.push(h);
     });
 
     return {
       modo: 'pagina',
-      text: texto,
+      text: markdown,
       fontes: [],
       fontes_general: [...new Set(fontesTodas)],
-      jogos: []
+      jogos: [],
+      estrutura: null
     };
   }
 
-  // ---------------------------------------------------------------------------
-  // 3.4) Loop: Copilot (10s) → Sports → Página
-  // ---------------------------------------------------------------------------
-  return await new Promise((resolve) => {
-    let attempts = 0;
-    const interval = setInterval(async () => {
-      attempts++;
+  // ===========================================================================
+  // 3.4) Cascata: IA → Jogo → Página
+  // ===========================================================================
+  const ia = tryIA();
+  if (ia) return ia;
 
-      const c = await tryCopilot();
-      if (c) { clearInterval(interval); resolve(c); return; }
+  const jogo = tryJogo();
+  if (jogo) return jogo;
 
-      if (attempts > 20) {
-        const s = await trySports();
-        if (s) { clearInterval(interval); resolve(s); return; }
+  const pagina = tryPagina();
+  if (pagina) return pagina;
 
-        const p = await tryWholePage();
-        clearInterval(interval);
-        resolve(p || { modo: 'nenhum', text: '', fontes: [], fontes_general: [], jogos: [] });
-      }
-    }, 500);
-  });
+  return { modo: 'nenhum', text: '', fontes: [], fontes_general: [], jogos: [], estrutura: null };
 }
 """
 
@@ -526,17 +624,16 @@ POOL = BrowserPool()
 # 7. NÚCLEO FLASH
 # =============================================================================
 
-# Modos válidos para o parâmetro "photo":
-#   "base64"  → devolve a imagem em base64 no JSON (string gigante)
-#   "url"     → salva PNG no servidor e devolve a URL /photos/xxx.png
-#   "none"    → não captura foto (mais rápido)
 PHOTO_MODOS = {"base64", "url", "none"}
 
 
 async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
     """
-    Executa a pesquisa em modo flash.
-    photo_modo: "base64" | "url" | "none"
+    Pesquisa em modo flash:
+      1. goto
+      2. espera 1.5s
+      3. extrai com JS em cascata (IA → Jogo → Página)
+      4. foto (opcional)
     """
     url = URL_TEMPLATE.format(q=quote_plus(query))
     t_ini = time.time()
@@ -548,48 +645,8 @@ async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
-        except Exception:
-            pass
+        await page.wait_for_timeout(1500)
 
-        await page.wait_for_timeout(800)
-
-        # ---------------------------------------------------------------------
-        # 1) CLICA EM "LER TUDO" (Playwright clique real)
-        #    Bing usa acf-button-standard, que não responde a element.click()
-        # ---------------------------------------------------------------------
-        clicou_ler_tudo = False
-        try:
-            for texto in (
-                "Ler tudo",
-                "Read more",
-                "Ver mais",
-                "Mostrar mais",
-                "Show more",
-            ):
-                loc = page.locator(
-                    f"button:has-text('{texto}'):visible, "
-                    f"a:has-text('{texto}'):visible, "
-                    f"div[role='button']:has-text('{texto}'):visible"
-                ).first
-
-                if await loc.count() > 0:
-                    try:
-                        await loc.scroll_into_view_if_needed(timeout=1000)
-                        await loc.click(timeout=2000)
-                        await page.wait_for_timeout(1000)  # 1s expande
-                        clicou_ler_tudo = True
-                        log.info(f"BOOT Ler tudo clicado ({texto!r})")
-                        break
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-
-        # ---------------------------------------------------------------------
-        # 2) EXTRAI COM O JS (com 2 tentativas em caso de navegação)
-        # ---------------------------------------------------------------------
         for tentativa in range(1, 3):
             try:
                 resultado = await page.evaluate(JS_CAPTURAR)
@@ -604,9 +661,6 @@ async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
                     continue
                 raise
 
-        # ---------------------------------------------------------------------
-        # 3) FOTO
-        # ---------------------------------------------------------------------
         if photo_modo == "url":
             try:
                 nome_foto = f"{uuid.uuid4().hex}.png"
@@ -630,6 +684,7 @@ async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
                 "fontes": [],
                 "fontes_general": [],
                 "jogos": [],
+                "estrutura": None,
             }
 
     except Exception as e:
@@ -642,6 +697,7 @@ async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
             "fontes": [],
             "fontes_general": [],
             "jogos": [],
+            "estrutura": None,
         }
 
     t_total = time.time() - t_ini
@@ -651,6 +707,7 @@ async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
     fontes = (resultado or {}).get("fontes", []) or []
     fontes_general = (resultado or {}).get("fontes_general", []) or []
     jogos = (resultado or {}).get("jogos", []) or []
+    estrutura = (resultado or {}).get("estrutura", None)
 
     return {
         "query": query,
@@ -660,6 +717,7 @@ async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
         "fontes": fontes,
         "fontes_general": fontes_general,
         "jogos": jogos,
+        "estrutura": estrutura,
         "foto_arquivo": foto_arquivo,
         "foto_b64": foto_b64,
         "tempo_s": round(t_total, 3),
@@ -673,7 +731,6 @@ async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
 
 @app.route("/photos/<path:nome>", methods=["GET"])
 def servir_foto(nome):
-    """Serve os PNGs salvos em PHOTOS_DIR."""
     return send_from_directory(PHOTOS_DIR.resolve(), nome)
 
 
@@ -683,6 +740,7 @@ def raiz():
         {
             "status": "ok",
             "service": BANNER,
+            "modos": ["ia", "jogo", "pagina"],
             "endpoints": {
                 "GET  /": "status",
                 "GET  /search?q=<termo>&photo=url|base64|none": "pesquisa flash",
@@ -720,6 +778,7 @@ def _executar_e_responder(query: str, ip: str, t0: float, photo_modo: str):
                     "fontes": [],
                     "fontes_general": [],
                     "jogos": [],
+                    "estrutura": None,
                     "photo": None,
                     "meta": {"erro": True},
                 }
@@ -735,7 +794,6 @@ def _executar_e_responder(query: str, ip: str, t0: float, photo_modo: str):
         f"photo={photo_modo} tempo={dados['tempo_s']}s total={total}s"
     )
 
-    # Monta o campo "photo" de acordo com o modo escolhido
     photo_field = None
     if photo_modo == "url" and dados["foto_arquivo"]:
         photo_field = {
@@ -752,24 +810,30 @@ def _executar_e_responder(query: str, ip: str, t0: float, photo_modo: str):
     elif photo_modo == "none":
         photo_field = {"tipo": "none"}
 
-    return jsonify(
-        {
-            "response": dados["texto"],
-            "fontes": dados["fontes"],
-            "fontes_general": dados["fontes_general"],
-            "jogos": dados["jogos"],
-            "photo": photo_field,
-            "meta": {
-                "query": dados["query"],
-                "url": dados["url"],
-                "modo": dados["modo"],
-                "chars": len(dados["texto"]),
-                "tempo_s": dados["tempo_s"],
-                "ip": ip,
-                "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            },
-        }
-    )
+    # Estrutura: se modo=jogo, devolve o JSON de dados do time
+    # Se modo=ia, devolve com "texto" (markdown). Se modo=pagina, devolve texto bruto.
+    response_data = {
+        "response": dados["texto"],
+        "fontes": dados["fontes"],
+        "fontes_general": dados["fontes_general"],
+        "jogos": dados["jogos"],
+        "photo": photo_field,
+        "meta": {
+            "query": dados["query"],
+            "url": dados["url"],
+            "modo": dados["modo"],
+            "chars": len(dados["texto"]),
+            "tempo_s": dados["tempo_s"],
+            "ip": ip,
+            "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        },
+    }
+
+    # No modo jogo, anexa a estrutura JSON bruta (time/competicao/partidas/classificacao)
+    if dados["modo"] == "jogo" and dados.get("estrutura"):
+        response_data["dados"] = dados["estrutura"]
+
+    return jsonify(response_data)
 
 
 @app.route("/search", methods=["GET"])
