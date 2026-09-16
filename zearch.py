@@ -28,7 +28,7 @@ from playwright.async_api import async_playwright
 app = Flask(__name__)
 
 PORT = int(os.environ.get("PORT", 5000))
-HEADLESS = False
+HEADLESS = True
 
 URL_TEMPLATE = "https://www.bing.com/search?FORM=HDRSC1&q={q}"
 
