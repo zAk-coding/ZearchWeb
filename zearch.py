@@ -109,17 +109,12 @@ def ip_do_cliente() -> str:
 
 
 # =============================================================================
-# 3. JS DE EXTRAÇÃO
-#    Cascata: IA (Markdown) → Jogo (JSON) → Página (texto bruto)
-#    Se nada for achado → devolve modo="nenhum"
+# 3. JS DE EXTRAÇÃO — Cascata: IA → Jogo → Página
 # =============================================================================
 
 JS_CAPTURAR = r"""
 () => {
 
-  // ===========================================================================
-  // 3.1) IA — Resposta do Copilot em Markdown
-  // ===========================================================================
   function tryIA() {
     const content = document.querySelector('#b_content');
     if (!content) return null;
@@ -128,8 +123,6 @@ JS_CAPTURAR = r"""
       'div[id^="cplt_frame_"], li.b_ans, #ca_main, .answer_container'
     );
     if (!firstItem) return null;
-
-    // Evita pegar Sports por engano
     if (firstItem.querySelector('#b_wpt_container')) return null;
 
     let source = firstItem;
@@ -200,9 +193,6 @@ JS_CAPTURAR = r"""
     };
   }
 
-  // ===========================================================================
-  // 3.2) JOGO — Arena de Esportes (JSON estruturado)
-  // ===========================================================================
   function tryJogo() {
     const container = document.querySelector('#b_wpt_container');
     if (!container) return null;
@@ -218,7 +208,6 @@ JS_CAPTURAR = r"""
       classificacao: []
     };
 
-    // ---- Partidas ----
     const cardsVistos = new Set();
     const cards = [];
     for (const sel of [
@@ -263,7 +252,6 @@ JS_CAPTURAR = r"""
       } catch (e) {}
     });
 
-    // Dedup partidas
     const unicos = new Set();
     data.partidas = data.partidas.filter(p => {
       const k = `${p.time_casa}|${p.time_fora}|${p.placar}`;
@@ -272,7 +260,6 @@ JS_CAPTURAR = r"""
       return true;
     });
 
-    // ---- Classificação ----
     const rowsVistas = new Set();
     const rows = [];
     for (const sel of [
@@ -350,9 +337,6 @@ JS_CAPTURAR = r"""
     };
   }
 
-  // ===========================================================================
-  // 3.3) PÁGINA — texto bruto da página
-  // ===========================================================================
   function tryPagina() {
     const root =
       document.querySelector('#b_content main') ||
@@ -411,8 +395,6 @@ JS_CAPTURAR = r"""
     for (const c of cortes) markdown = markdown.split(c)[0];
 
     markdown = markdown.replace(/\n{3,}/g, '\n\n').trim();
-
-    // Se a página veio vazia (< 30 chars), considera falha
     if (markdown.length < 30) return null;
 
     const fontesTodas = [];
@@ -431,9 +413,6 @@ JS_CAPTURAR = r"""
     };
   }
 
-  // ===========================================================================
-  // 3.4) Cascata
-  // ===========================================================================
   const ia = tryIA();
   if (ia) return ia;
 
@@ -443,7 +422,6 @@ JS_CAPTURAR = r"""
   const pagina = tryPagina();
   if (pagina) return pagina;
 
-  // Se nada funcionou, devolve modo="nenhum" (o Python trata)
   return { modo: 'nenhum', text: '', fontes: [], fontes_general: [], jogos: [], estrutura: null };
 }
 """
@@ -496,7 +474,7 @@ LOOP_BG = LoopBackground()
 
 
 # =============================================================================
-# 6. BROWSER PERSISTENTE (headless forçado)
+# 6. BROWSER PERSISTENTE + ANTI-DETECÇÃO
 # =============================================================================
 
 
@@ -513,7 +491,7 @@ class BrowserPool:
         t0 = time.time()
         self._playwright = await async_playwright().start()
 
-        # headless=True HARDCODED — evita erro de XServer no Render
+        # headless=True hardcoded + flags anti-detecção
         self._browser = await self._playwright.chromium.launch(
             headless=True,
             args=[
@@ -524,12 +502,15 @@ class BrowserPool:
                 "--disable-background-networking",
                 "--disable-sync",
                 "--no-first-run",
-                "--disable-features=Translate,BackForwardCache",
+                "--disable-features=Translate,BackForwardCache,AutomationControlled",
                 "--disable-background-timer-throttling",
                 "--disable-renderer-backgrounding",
                 "--disable-backgrounding-occluded-windows",
+                "--disable-blink-features=AutomationControlled",
+                "--exclude-switches=enable-automation",
             ],
         )
+
         self._context = await self._browser.new_context(
             user_agent=UA_MOBILE,
             viewport=VIEWPORT,
@@ -537,14 +518,40 @@ class BrowserPool:
             is_mobile=True,
             has_touch=True,
             locale="pt-BR",
+            timezone_id="America/Sao_Paulo",
             java_script_enabled=True,
+            extra_http_headers={
+                "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Sec-Ch-Ua": '"Chromium";v="152", "Not_A Brand";v="24"',
+                "Sec-Ch-Ua-Mobile": "?1",
+                "Sec-Ch-Ua-Platform": '"Android"',
+            },
         )
+
         await self._context.add_cookies(
             [
                 {"name": k, "value": v, "domain": ".bing.com", "path": "/"}
                 for k, v in COOKIES.items()
             ]
         )
+
+        # Remove sinais de automação visíveis ao JS
+        await self._context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['pt-BR', 'pt', 'en-US', 'en']
+            });
+            window.chrome = window.chrome || { runtime: {} };
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : originalQuery(parameters)
+            );
+        """)
+
         self._page = await self._context.new_page()
         log.info(f"BOOT Chromium pronto em {round(time.time()-t0, 2)}s")
 
@@ -569,13 +576,6 @@ PHOTO_MODOS = {"base64", "url", "none"}
 
 
 async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
-    """
-    Pesquisa em modo flash:
-      1. goto
-      2. espera 1.5s
-      3. extrai com JS em cascata (IA → Jogo → Página → Nenhum)
-      4. foto (opcional)
-    """
     url = URL_TEMPLATE.format(q=quote_plus(query))
     t_ini = time.time()
 
@@ -586,9 +586,40 @@ async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(1500)
 
-        # 2 tentativas em caso de navegação
+        # Espera o #b_content ter conteúdo de verdade
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const c = document.querySelector('#b_content');
+                    return c && c.innerText && c.innerText.trim().length > 100;
+                }""",
+                timeout=12000,
+            )
+            log.info("BOOT #b_content carregado com conteúdo")
+        except Exception:
+            log.warning("BOOT #b_content vazio após 12s — página em branco")
+
+        # Espera extra pra IA escrever
+        await page.wait_for_timeout(1200)
+
+        # Diagnóstico
+        try:
+            html_len = len(await page.content())
+            n_content = await page.locator("#b_content").count()
+            n_results = await page.locator("#b_results").count()
+            n_algo = await page.locator(".b_algo").count()
+            n_ca = await page.locator("#ca_main, #copans_container").count()
+            n_wpt = await page.locator("#b_wpt_container").count()
+            log.info(
+                f"BOOT HTML={html_len}b #b_content={n_content} "
+                f"#b_results={n_results} .b_algo={n_algo} "
+                f"#ca_main={n_ca} #b_wpt={n_wpt}"
+            )
+        except Exception as e:
+            log.warning(f"BOOT diagnóstico falhou: {e}")
+
+        # Extração
         for tentativa in range(1, 3):
             try:
                 resultado = await page.evaluate(JS_CAPTURAR)
@@ -603,7 +634,7 @@ async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
                     continue
                 raise
 
-        # Foto (opcional)
+        # Foto
         if photo_modo == "url":
             try:
                 nome_foto = f"{uuid.uuid4().hex}.png"
@@ -749,7 +780,6 @@ def _executar_e_responder(query: str, ip: str, t0: float, photo_modo: str):
     elif photo_modo == "none":
         photo_field = {"tipo": "none"}
 
-    # Se não achou NENHUM seletor conhecido, devolve aviso claro
     if dados["modo"] == "nenhum" or not dados["texto"]:
         return jsonify(
             {
