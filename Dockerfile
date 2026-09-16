@@ -11,4 +11,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Render injeta $PORT automaticamente
-CMD gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1
+CMD gunicorn zearch:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1
