@@ -1,6 +1,6 @@
 # =============================================================================
 # ZEARCH WEB - ZW-1 PROFESSIONAL
-# Servidor Flask para deploy no Render
+# Servidor Flask (async) para deploy no Render
 # =============================================================================
 
 import os
@@ -16,19 +16,19 @@ from flask import Flask, request, jsonify
 from playwright.async_api import async_playwright
 
 # =============================================================================
-# CONFIGURAÇÃO GERAL
+# CONFIGURAÇÃO
 # =============================================================================
 
-# Flask app (o Render vai procurar por `app` no módulo)
+# Flask app (gunicorn usa `zearch:app`)
 app = Flask(__name__)
 
-# Porta padrão do Render é 10000, mas cai pra 5000 em dev local
+# Porta — Render injeta $PORT automaticamente
 PORT = int(os.environ.get("PORT", 5000))
 
-# Em produção o browser roda sempre invisível
+# Em servidor sempre headless
 HEADLESS = True
 
-# URL base da pesquisa no Bing (q = query)
+# URL base da pesquisa no Bing
 URL_TEMPLATE = "https://www.bing.com/search?FORM=HDRSC1&q={q}"
 
 # User-Agent mobile (Pixel 7 / Android 14 / Chrome 152)
@@ -38,7 +38,7 @@ UA_MOBILE = (
     "Chrome/152.0.0.0 Mobile Safari/537.36"
 )
 
-# Cookies fixos injetados no contexto (mantém sessão do Bing)
+# Cookies fixos da sessão do Bing
 COOKIES = {
     "MUID": "1A41BE0E6A7362A90231A9916B8863E3",
     "MUIDB": "1A41BE0E6A7362A90231A9916B8863E3",
@@ -51,17 +51,15 @@ COOKIES = {
     "USRLOC": "HS=1&ELOC=LAT=-23.96164894104004|LON=-46.350807189941406|N=Santos%2C%20S%C3%A3o%20Paulo|ELT=4|",
 }
 
-# Banner curto de identificação (aparece na rota raiz)
 BANNER = "ZEARCH WEB • ZW-1 • Professional"
 
 
 # =============================================================================
-# JS — ESTRATÉGIAS DE EXTRAÇÃO (executado dentro da página)
-# =============================================================================
+# JS — ESTRATÉGIAS DE EXTRAÇÃO
 # Ordem:
-#   1) Copilot     → #b_mcw / #copans_container → #ca_main
-#   2) Sports      → .answer_container → #b_wpt_container → cards de jogo
-#   3) Página toda → body.cloneNode(true)
+#   1) Copilot  → #b_mcw / #copans_container → #ca_main
+#   2) Sports   → .answer_container → #b_wpt_container → cards
+#   3) Página   → body.cloneNode(true)
 # =============================================================================
 
 JS_CAPTURAR = r"""
@@ -81,12 +79,10 @@ async () => {
         wrapper;
     if (!caMain || (caMain.innerText || '').trim().length < 100) return null;
 
-    // Só considera pronto quando o feedback (Curtir/Não gosto) já apareceu
     const feedbackPronto =
         !!wrapper.querySelector('.gs_secctrl, acf-thumbs-up-down-feedback, .ca_action_btn');
     if (!feedbackPronto) return null;
 
-    // Se por acaso o wrapper contém bloco de esportes, não é Copilot
     if (caMain.querySelector('.bsp_mgz_schedule, .bsp_mgz_standings, #b_wpt_container')) {
       return null;
     }
@@ -129,7 +125,7 @@ async () => {
   }
 
   // ---------------------------------------------------------------------------
-  // 2) Sports — jogos (futebol, etc)
+  // 2) Sports — tabela de jogos
   // ---------------------------------------------------------------------------
   async function trySports() {
     const ac = document.querySelector('.answer_container');
@@ -170,7 +166,6 @@ async () => {
       } catch (e) {}
     });
 
-    // Fallback via linhas de texto
     if (jogos.length === 0) {
       const rawLines = container.innerText.split('\n')
           .map(s => s.trim()).filter(s => s !== '');
@@ -251,7 +246,7 @@ async () => {
   }
 
   // ---------------------------------------------------------------------------
-  // Loop de tentativas: Copilot (10s) → Sports → Página inteira
+  // Loop: Copilot (10s) → Sports → Página
   // ---------------------------------------------------------------------------
   return await new Promise((resolve) => {
     let attempts = 0;
@@ -279,8 +274,9 @@ async () => {
 # HELPERS
 # =============================================================================
 
+
 def limpar_texto(texto: str) -> str:
-    """Remove linhas vazias duplicadas e normaliza espaços em branco."""
+    """Remove linhas vazias duplicadas e normaliza espaços."""
     linhas, vazias = [], 0
     for linha in texto.splitlines():
         linha = linha.rstrip()
@@ -295,7 +291,7 @@ def limpar_texto(texto: str) -> str:
 
 
 def ram_atual_mb() -> float:
-    """RAM do próprio processo Python em MB."""
+    """RAM do processo Python em MB."""
     return psutil.Process().memory_info().rss / 1024 / 1024
 
 
@@ -306,7 +302,7 @@ def ram_sistema_mb():
 
 
 def ram_browsers_mb() -> float:
-    """Soma a RAM de todos os processos Chromium/Chrome em MB."""
+    """Soma a RAM dos processos Chromium/Chrome em MB."""
     total = 0.0
     for p in psutil.process_iter(["name", "memory_info"]):
         try:
@@ -318,17 +314,22 @@ def ram_browsers_mb() -> float:
     return total
 
 
-def abrir_browser(p):
+# =============================================================================
+# NÚCLEO — versão ASYNC
+# =============================================================================
+
+
+async def abrir_browser(p):
     """
-    Abre um Chromium headless (invisível) configurado para mobile.
+    Abre Chromium headless async em modo mobile.
     Retorna (browser, context, page).
     """
-    browser = p.chromium.launch(
+    browser = await p.chromium.launch(
         headless=HEADLESS,
         args=[
-            "--disable-gpu",                 # sem GPU (servidor não tem)
-            "--no-sandbox",                  # necessário em containers
-            "--disable-dev-shm-usage",       # evita erro de /dev/shm pequeno
+            "--disable-gpu",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
             "--disable-extensions",
             "--disable-background-networking",
             "--disable-sync",
@@ -339,9 +340,9 @@ def abrir_browser(p):
             "--disable-backgrounding-occluded-windows",
         ],
     )
-    context = browser.new_context(
+    context = await browser.new_context(
         user_agent=UA_MOBILE,
-        viewport={"width": 412, "height": 915},   # Pixel 7
+        viewport={"width": 412, "height": 915},
         device_scale_factor=2.625,
         is_mobile=True,
         has_touch=True,
@@ -349,70 +350,58 @@ def abrir_browser(p):
         java_script_enabled=True,
     )
 
-    # Cookies injetados no domínio .bing.com
-    context.add_cookies([
-        {"name": k, "value": v, "domain": ".bing.com", "path": "/"}
-        for k, v in COOKIES.items()
-    ])
+    await context.add_cookies(
+        [
+            {"name": k, "value": v, "domain": ".bing.com", "path": "/"}
+            for k, v in COOKIES.items()
+        ]
+    )
 
-    page = context.new_page()
+    page = await context.new_page()
     return browser, context, page
 
 
-# =============================================================================
-# NÚCLEO DA PESQUISA
-# =============================================================================
-
-def executar_pesquisa(query: str) -> dict:
+async def executar_pesquisa(query: str) -> dict:
     """
-    Faz a pesquisa completa:
-      - abre Chromium headless
-      - navega até a URL de busca
-      - roda o JS de extração (Copilot → Sports → Página inteira)
-      - fecha o browser
-      - retorna dict com modo/texto/fontes/jogos/métricas
+    Pesquisa completa em modo async.
     """
     url = URL_TEMPLATE.format(q=quote_plus(query))
 
-    # Métricas iniciais
     ram_ini_script = ram_atual_mb()
     sys_ini, sys_total = ram_sistema_mb()
     t_ini = time.time()
 
-    p = sync_playwright().start()
-    browser, context, page = abrir_browser(p)
+    p = await async_playwright().start()
+    browser, context, page = await abrir_browser(p)
 
     try:
-        # Navega para a página de busca (com timeout folgado pra Render)
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
-
-        # Aguarda + executa o JS de extração
-        resultado = page.evaluate(JS_CAPTURAR)
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        resultado = await page.evaluate(JS_CAPTURAR)
     except Exception as e:
+        import traceback
+
+        traceback.print_exc()
         resultado = {
             "modo": "erro",
-            "text": f"Falha na extração: {e}",
+            "text": f"Falha na extração: {type(e).__name__}: {e}",
             "sources": [],
             "jogos": [],
         }
     finally:
-        # Sempre fecha browser para não vazar processo
         try:
-            browser.close()
+            await browser.close()
         except Exception:
             pass
         try:
-            p.stop()
+            await p.stop()
         except Exception:
             pass
 
-    # Métricas finais
     t_total = time.time() - t_ini
     ram_fim_script = ram_atual_mb()
     sys_fim, _ = ram_sistema_mb()
     ram_chrome = ram_browsers_mb()
 
-    # Normaliza texto
     modo = (resultado or {}).get("modo", "nenhum")
     texto = limpar_texto((resultado or {}).get("text", "") or "")
     fontes = (resultado or {}).get("sources", []) or []
@@ -442,87 +431,130 @@ def executar_pesquisa(query: str) -> dict:
 # ROTAS FLASK
 # =============================================================================
 
+
 @app.route("/", methods=["GET"])
 def raiz():
-    """Rota de status — confirma que o servidor está no ar."""
-    return jsonify({
-        "status": "ok",
-        "service": BANNER,
-        "endpoints": {
-            "GET /": "status",
-            "GET /search?q=<termo>": "faz a pesquisa e devolve JSON",
-        },
-    })
+    """Status do servidor."""
+    return jsonify(
+        {
+            "status": "ok",
+            "service": BANNER,
+            "endpoints": {
+                "GET /": "status",
+                "GET /search?q=<termo>": "pesquisa via query string",
+                "POST /search": 'pesquisa via JSON body {"q":"..."}',
+            },
+        }
+    )
 
 
 @app.route("/search", methods=["GET"])
 def rota_search():
-    """
-    Pesquisa via query string.
-    Exemplo: /search?q=nobru
-    """
+    """Pesquisa via GET: /search?q=nobru"""
     query = (request.args.get("q") or "").strip()
     if not query:
-        return jsonify({
-            "error": "Parâmetro 'q' é obrigatório",
-            "example": "/search?q=nobru",
-        }), 400
+        return (
+            jsonify(
+                {
+                    "error": "Parâmetro 'q' é obrigatório",
+                    "example": "/search?q=nobru",
+                }
+            ),
+            400,
+        )
 
-    dados = executar_pesquisa(query)
+    # Cria event loop próprio e roda a coroutine async
+    dados = asyncio.run(executar_pesquisa(query))
 
-    # Resposta padrão: campo "Result" com o texto extraído
-    return jsonify({
-        "Result": dados["texto"],
-        "Meta": {
-            "query": dados["query"],
-            "url": dados["url"],
-            "modo": dados["modo"],
-            "chars": len(dados["texto"]),
-            "fontes": dados["fontes"],
-            "jogos": dados["jogos"],
-            "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "metricas": dados["metricas"],
-        },
-    })
+    if dados["modo"] == "erro":
+        return (
+            jsonify(
+                {
+                    "Result": dados["texto"],
+                    "Meta": {
+                        "query": dados["query"],
+                        "url": dados["url"],
+                        "modo": dados["modo"],
+                        "erro": True,
+                        "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    },
+                }
+            ),
+            500,
+        )
+
+    return jsonify(
+        {
+            "Result": dados["texto"],
+            "Meta": {
+                "query": dados["query"],
+                "url": dados["url"],
+                "modo": dados["modo"],
+                "chars": len(dados["texto"]),
+                "fontes": dados["fontes"],
+                "jogos": dados["jogos"],
+                "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "metricas": dados["metricas"],
+            },
+        }
+    )
 
 
 @app.route("/search", methods=["POST"])
 def rota_search_post():
-    """
-    Pesquisa via JSON no corpo.
-    Exemplo: POST /search  {"q": "nobru"}
-    """
+    """Pesquisa via POST JSON: {"q": "nobru"}"""
     payload = request.get_json(silent=True) or {}
     query = (payload.get("q") or payload.get("query") or "").strip()
 
     if not query:
-        return jsonify({
-            "error": "Campo 'q' (ou 'query') é obrigatório no JSON",
-            "example": {"q": "nobru"},
-        }), 400
+        return (
+            jsonify(
+                {
+                    "error": "Campo 'q' (ou 'query') é obrigatório no JSON",
+                    "example": {"q": "nobru"},
+                }
+            ),
+            400,
+        )
 
-    dados = executar_pesquisa(query)
+    dados = asyncio.run(executar_pesquisa(query))
 
-    return jsonify({
-        "Result": dados["texto"],
-        "Meta": {
-            "query": dados["query"],
-            "url": dados["url"],
-            "modo": dados["modo"],
-            "chars": len(dados["texto"]),
-            "fontes": dados["fontes"],
-            "jogos": dados["jogos"],
-            "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "metricas": dados["metricas"],
-        },
-    })
+    if dados["modo"] == "erro":
+        return (
+            jsonify(
+                {
+                    "Result": dados["texto"],
+                    "Meta": {
+                        "query": dados["query"],
+                        "url": dados["url"],
+                        "modo": dados["modo"],
+                        "erro": True,
+                        "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    },
+                }
+            ),
+            500,
+        )
+
+    return jsonify(
+        {
+            "Result": dados["texto"],
+            "Meta": {
+                "query": dados["query"],
+                "url": dados["url"],
+                "modo": dados["modo"],
+                "chars": len(dados["texto"]),
+                "fontes": dados["fontes"],
+                "jogos": dados["jogos"],
+                "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "metricas": dados["metricas"],
+            },
+        }
+    )
 
 
 # =============================================================================
-# ENTRYPOINT
-# =============================================================================
-# Render usa `gunicorn app:app` (ou similar) e define $PORT.
-# Aqui só rodamos localmente se executado direto.
+# ENTRYPOINT (só roda se executar direto — Render usa gunicorn)
 # =============================================================================
 
 if __name__ == "__main__":
