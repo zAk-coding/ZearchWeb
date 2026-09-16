@@ -9,7 +9,6 @@ import sys
 import time
 import uuid
 import base64
-import json as _json
 import asyncio
 import logging
 import threading
@@ -28,7 +27,6 @@ from playwright.async_api import async_playwright
 app = Flask(__name__)
 
 PORT = int(os.environ.get("PORT", 5000))
-HEADLESS = True
 
 URL_TEMPLATE = "https://www.bing.com/search?FORM=HDRSC1&q={q}"
 
@@ -111,17 +109,16 @@ def ip_do_cliente() -> str:
 
 
 # =============================================================================
-# 3. JS — TRÊS ESTRATÉGIAS
-#    1) IA (Markdown)  →  se achar #b_content com bloco de resposta
-#    2) Jogo  (JSON)   →  se achar #b_wpt_container com cards de partidas
-#    3) Página (txt)   →  fallback bruto de toda a página
+# 3. JS DE EXTRAÇÃO
+#    Cascata: IA (Markdown) → Jogo (JSON) → Página (texto bruto)
+#    Se nada for achado → devolve modo="nenhum"
 # =============================================================================
 
 JS_CAPTURAR = r"""
 () => {
 
   // ===========================================================================
-  // 3.1) IA — Resposta do Copilot convertida em Markdown
+  // 3.1) IA — Resposta do Copilot em Markdown
   // ===========================================================================
   function tryIA() {
     const content = document.querySelector('#b_content');
@@ -132,7 +129,7 @@ JS_CAPTURAR = r"""
     );
     if (!firstItem) return null;
 
-    // Evita pegar Sports por engano — Sports tem #b_wpt_container
+    // Evita pegar Sports por engano
     if (firstItem.querySelector('#b_wpt_container')) return null;
 
     let source = firstItem;
@@ -206,7 +203,7 @@ JS_CAPTURAR = r"""
   // ===========================================================================
   // 3.2) JOGO — Arena de Esportes (JSON estruturado)
   // ===========================================================================
-   function tryJogo() {
+  function tryJogo() {
     const container = document.querySelector('#b_wpt_container');
     if (!container) return null;
 
@@ -221,96 +218,52 @@ JS_CAPTURAR = r"""
       classificacao: []
     };
 
-    // -------------------------------------------------------------------------
-    // 1) PARTIDAS — múltiplos seletores, um card por partida
-    // -------------------------------------------------------------------------
-    const seletoresCards = [
-      '.bsp_schedule_mtch_crd .bsp_match_card',      // layout novo (já funcionava)
-      '.bsp_match_card',                              // genérico
-      '.b_mtcctnr',                                   // container interno
-      '[role="listitem"]',                            // slides
-    ];
-
+    // ---- Partidas ----
     const cardsVistos = new Set();
     const cards = [];
-
-    for (const sel of seletoresCards) {
+    for (const sel of [
+      '.bsp_schedule_mtch_crd .bsp_match_card',
+      '.bsp_match_card',
+      '.b_mtcctnr',
+      '[role="listitem"]',
+    ]) {
       container.querySelectorAll(sel).forEach(c => {
-        if (!cardsVistos.has(c)) {
-          cardsVistos.add(c);
-          cards.push(c);
-        }
+        if (!cardsVistos.has(c)) { cardsVistos.add(c); cards.push(c); }
       });
     }
 
     cards.forEach(card => {
       try {
-        // Time da casa — múltiplos seletores
         const timeCasaEl = card.querySelector('.bsp_team:first-of-type .team-name-ellipsis')
-                       || card.querySelectorAll('.bsp_team')[0]?.querySelector('.team-name-ellipsis')
-                       || card.querySelectorAll('.bsp-team-name .team-name-ellipsis')[0];
+                       || card.querySelectorAll('.bsp_team')[0]?.querySelector('.team-name-ellipsis');
         const timeForaEl = card.querySelector('.bsp_team:last-of-type .team-name-ellipsis')
-                       || card.querySelectorAll('.bsp_team')[1]?.querySelector('.team-name-ellipsis')
-                       || card.querySelectorAll('.bsp-team-name .team-name-ellipsis')[1];
+                       || card.querySelectorAll('.bsp_team')[1]?.querySelector('.team-name-ellipsis');
 
         const time_casa = (timeCasaEl?.innerText || '').trim();
         const time_fora = (timeForaEl?.innerText || '').trim();
 
-        // Placar
         const scores = card.querySelectorAll('.bsp_team_scr, .bsp_mag_score > div');
         const placar_casa = scores[0] ? scores[0].innerText.trim() : '';
         const placar_fora = scores[1] ? scores[1].innerText.trim() : '';
 
-        // Competição
         const compEl = card.querySelector('.bsp_mtc_tps div')
                     || card.querySelector('[title*="·"]');
-        const torneio = compEl
-          ? (compEl.getAttribute('title') || compEl.innerText.trim())
-          : '';
+        const torneio = compEl ? (compEl.getAttribute('title') || compEl.innerText.trim()) : '';
 
-        // Status / data
-        const status = (card.querySelector('.bsp_game_info > div:first-child')?.innerText
-                    || card.querySelector('.game-info > div:first-child')?.innerText
-                    || '').trim();
-        const data_jogo = (card.querySelector('.bsp_game_time')?.innerText
-                       || card.querySelector('.game-time')?.innerText
-                       || '').trim();
+        const status = (card.querySelector('.bsp_game_info > div:first-child')?.innerText || '').trim();
+        const data_jogo = (card.querySelector('.bsp_game_time')?.innerText || '').trim();
 
-        // Só adiciona se tem pelo menos time_casa e time_fora
         if (time_casa && time_fora) {
           data.partidas.push({
-            torneio,
-            time_casa,
-            time_fora,
+            torneio, time_casa, time_fora,
             placar: `${placar_casa} x ${placar_fora}`,
-            status,
-            data: data_jogo,
-            horario: 'N/A'
+            status, data: data_jogo, horario: 'N/A'
           });
-        } else {
-          // Fallback: parsing por linhas (o jeito antigo)
-          const linhas = card.innerText.split('\n')
-            .map(l => l.trim()).filter(l => l.length > 0);
-          for (let i = 0; i < linhas.length; i++) {
-            if (linhas[i] && linhas[i+1] && linhas[i+2]
-                && linhas[i+3] !== undefined && linhas[i+4] !== undefined) {
-              data.partidas.push({
-                torneio: linhas[i],
-                time_casa: linhas[i+1],
-                time_fora: linhas[i+2],
-                placar: `${linhas[i+3]} x ${linhas[i+4]}`,
-                status: linhas[i+5] || '',
-                data: linhas[i+6] || '',
-                horario: 'N/A'
-              });
-              i += 6;
-            }
-          }
         }
       } catch (e) {}
     });
 
-    // Dedup por (time_casa + time_fora + placar)
+    // Dedup partidas
     const unicos = new Set();
     data.partidas = data.partidas.filter(p => {
       const k = `${p.time_casa}|${p.time_fora}|${p.placar}`;
@@ -319,31 +272,22 @@ JS_CAPTURAR = r"""
       return true;
     });
 
-    // -------------------------------------------------------------------------
-    // 2) CLASSIFICAÇÃO — múltiplos seletores
-    // -------------------------------------------------------------------------
-    const seletoresClass = [
-      '.bsp_mgz_standings .bsp_row_item',   // layout novo
+    // ---- Classificação ----
+    const rowsVistas = new Set();
+    const rows = [];
+    for (const sel of [
+      '.bsp_mgz_standings .bsp_row_item',
       '.bsp_std_list tr',
       '.b_snippet li',
       'tr',
-    ];
-
-    const rowsVistas = new Set();
-    const rows = [];
-
-    for (const sel of seletoresClass) {
+    ]) {
       container.querySelectorAll(sel).forEach(r => {
-        if (!rowsVistas.has(r)) {
-          rowsVistas.add(r);
-          rows.push(r);
-        }
+        if (!rowsVistas.has(r)) { rowsVistas.add(r); rows.push(r); }
       });
     }
 
     rows.forEach(row => {
       try {
-        // Modo A: estrutura com classes
         const posEl = row.querySelector('.bsp_row_rank');
         const timeEl = row.querySelector('.bsp_row_teamname, .team-name-ellipsis');
         const ptsEl = row.querySelector('.bsp_col_pts');
@@ -358,7 +302,6 @@ JS_CAPTURAR = r"""
           }
         }
 
-        // Modo B: parsing por texto
         const text = row.innerText.split('\n').map(t => t.trim()).filter(t => t.length > 0);
         if (text.length >= 3 && !isNaN(text[0])) {
           data.classificacao.push({
@@ -370,7 +313,6 @@ JS_CAPTURAR = r"""
       } catch (e) {}
     });
 
-    // Dedup por posição
     const posVistas = new Set();
     data.classificacao = data.classificacao.filter(c => {
       if (posVistas.has(c.posicao)) return false;
@@ -378,17 +320,12 @@ JS_CAPTURAR = r"""
       return true;
     });
 
-    // -------------------------------------------------------------------------
-    // 3) VALIDAÇÃO — só retorna se achou algo
-    // -------------------------------------------------------------------------
     if (data.partidas.length === 0 && data.classificacao.length === 0) return null;
 
-    // Texto plano (fallback legível)
     const linhas = [];
     if (data.time) linhas.push(`# ${data.time}`);
     if (data.competicao) linhas.push(`_${data.competicao}_`);
     linhas.push('');
-
     if (data.partidas.length) {
       linhas.push('## Partidas');
       data.partidas.forEach(p => {
@@ -396,7 +333,6 @@ JS_CAPTURAR = r"""
       });
       linhas.push('');
     }
-
     if (data.classificacao.length) {
       linhas.push('## Classificação');
       data.classificacao.forEach(c => {
@@ -415,7 +351,7 @@ JS_CAPTURAR = r"""
   }
 
   // ===========================================================================
-  // 3.3) PÁGINA — fallback bruto (texto puro, sem links)
+  // 3.3) PÁGINA — texto bruto da página
   // ===========================================================================
   function tryPagina() {
     const root =
@@ -475,7 +411,9 @@ JS_CAPTURAR = r"""
     for (const c of cortes) markdown = markdown.split(c)[0];
 
     markdown = markdown.replace(/\n{3,}/g, '\n\n').trim();
-    if (markdown.length < 50) return null;
+
+    // Se a página veio vazia (< 30 chars), considera falha
+    if (markdown.length < 30) return null;
 
     const fontesTodas = [];
     root.querySelectorAll('a[href^="http"]').forEach(a => {
@@ -494,7 +432,7 @@ JS_CAPTURAR = r"""
   }
 
   // ===========================================================================
-  // 3.4) Cascata: IA → Jogo → Página
+  // 3.4) Cascata
   // ===========================================================================
   const ia = tryIA();
   if (ia) return ia;
@@ -505,6 +443,7 @@ JS_CAPTURAR = r"""
   const pagina = tryPagina();
   if (pagina) return pagina;
 
+  // Se nada funcionou, devolve modo="nenhum" (o Python trata)
   return { modo: 'nenhum', text: '', fontes: [], fontes_general: [], jogos: [], estrutura: null };
 }
 """
@@ -557,7 +496,7 @@ LOOP_BG = LoopBackground()
 
 
 # =============================================================================
-# 6. BROWSER PERSISTENTE
+# 6. BROWSER PERSISTENTE (headless forçado)
 # =============================================================================
 
 
@@ -573,8 +512,10 @@ class BrowserPool:
         log.info("BOOT Chromium iniciando...")
         t0 = time.time()
         self._playwright = await async_playwright().start()
+
+        # headless=True HARDCODED — evita erro de XServer no Render
         self._browser = await self._playwright.chromium.launch(
-            headless=HEADLESS,
+            headless=True,
             args=[
                 "--disable-gpu",
                 "--no-sandbox",
@@ -632,7 +573,7 @@ async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
     Pesquisa em modo flash:
       1. goto
       2. espera 1.5s
-      3. extrai com JS em cascata (IA → Jogo → Página)
+      3. extrai com JS em cascata (IA → Jogo → Página → Nenhum)
       4. foto (opcional)
     """
     url = URL_TEMPLATE.format(q=quote_plus(query))
@@ -647,6 +588,7 @@ async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
         await page.wait_for_timeout(1500)
 
+        # 2 tentativas em caso de navegação
         for tentativa in range(1, 3):
             try:
                 resultado = await page.evaluate(JS_CAPTURAR)
@@ -661,6 +603,7 @@ async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
                     continue
                 raise
 
+        # Foto (opcional)
         if photo_modo == "url":
             try:
                 nome_foto = f"{uuid.uuid4().hex}.png"
@@ -679,8 +622,8 @@ async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
 
         if resultado is None:
             resultado = {
-                "modo": "erro",
-                "text": "Sem resultado",
+                "modo": "nenhum",
+                "text": "",
                 "fontes": [],
                 "fontes_general": [],
                 "jogos": [],
@@ -740,18 +683,13 @@ def raiz():
         {
             "status": "ok",
             "service": BANNER,
-            "modos": ["ia", "jogo", "pagina"],
+            "modos": ["ia", "jogo", "pagina", "nenhum"],
             "endpoints": {
                 "GET  /": "status",
                 "GET  /search?q=<termo>&photo=url|base64|none": "pesquisa flash",
                 "POST /search": 'idem, JSON body {"q":"...","photo":"url"}',
-                "GET  /warmup": "esquenta o Chromium (após deploy)",
-                "GET  /photos/<file>": "baixa a foto capturada",
-            },
-            "photo_modes": {
-                "url": "salva PNG no servidor, devolve /photos/<file>",
-                "base64": "devolve string base64 no JSON",
-                "none": "não captura foto (mais rápido)",
+                "GET  /warmup": "esquenta o Chromium",
+                "GET  /photos/<file>": "baixa a foto",
             },
         }
     )
@@ -774,11 +712,12 @@ def _executar_e_responder(query: str, ip: str, t0: float, photo_modo: str):
         return (
             jsonify(
                 {
-                    "response": f"Erro: {type(e).__name__}: {e}",
+                    "response": None,
+                    "erro": f"{type(e).__name__}: {e}",
+                    "modo": "erro",
                     "fontes": [],
                     "fontes_general": [],
                     "jogos": [],
-                    "estrutura": None,
                     "photo": None,
                     "meta": {"erro": True},
                 }
@@ -810,8 +749,29 @@ def _executar_e_responder(query: str, ip: str, t0: float, photo_modo: str):
     elif photo_modo == "none":
         photo_field = {"tipo": "none"}
 
-    # Estrutura: se modo=jogo, devolve o JSON de dados do time
-    # Se modo=ia, devolve com "texto" (markdown). Se modo=pagina, devolve texto bruto.
+    # Se não achou NENHUM seletor conhecido, devolve aviso claro
+    if dados["modo"] == "nenhum" or not dados["texto"]:
+        return jsonify(
+            {
+                "response": None,
+                "erro": "Nenhum seletor conhecido encontrado nesta página.",
+                "modo": "nenhum",
+                "fontes": [],
+                "fontes_general": dados["fontes_general"],
+                "jogos": [],
+                "photo": photo_field,
+                "meta": {
+                    "query": dados["query"],
+                    "url": dados["url"],
+                    "modo": "nenhum",
+                    "chars": 0,
+                    "tempo_s": dados["tempo_s"],
+                    "ip": ip,
+                    "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            }
+        )
+
     response_data = {
         "response": dados["texto"],
         "fontes": dados["fontes"],
@@ -829,7 +789,6 @@ def _executar_e_responder(query: str, ip: str, t0: float, photo_modo: str):
         },
     }
 
-    # No modo jogo, anexa a estrutura JSON bruta (time/competicao/partidas/classificacao)
     if dados["modo"] == "jogo" and dados.get("estrutura"):
         response_data["dados"] = dados["estrutura"]
 
