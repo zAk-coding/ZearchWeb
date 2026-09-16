@@ -120,7 +120,7 @@ async () => {
   // ---------------------------------------------------------------------------
   // 3.1) Copilot — resposta da IA (melhor caso)
   // ---------------------------------------------------------------------------
-  async function tryCopilot() {
+    async function tryCopilot() {
     const wrapper =
         document.querySelector('#b_mcw') ||
         document.querySelector('#copans_container');
@@ -136,13 +136,37 @@ async () => {
       return null;
     }
 
+    // -------------------------------------------------------------------------
+    // FLASH: clica em "Ler tudo" se existir (1 clique rápido, sem loop)
+    // -------------------------------------------------------------------------
+    const lerTudo = Array.from(wrapper.querySelectorAll('button, a, div[role="button"]'))
+      .find(el => {
+        const t = (el.textContent || '').toLowerCase();
+        return (t.includes('ler tudo') || t.includes('read more') || t.includes('ver mais'))
+               && el.offsetParent !== null;
+      });
+
+    if (lerTudo) {
+      try {
+        lerTudo.scrollIntoView({ block: 'center' });
+        lerTudo.click();
+        // 1s pra expandir
+        await new Promise(r => setTimeout(r, 1000));
+      } catch (e) {}
+    }
+
+    // -------------------------------------------------------------------------
     // Fontes do Copilot (citações reais)
+    // -------------------------------------------------------------------------
     const fontesCopilot = [];
     wrapper.querySelectorAll('a[data-url]').forEach(a => {
       const u = a.getAttribute('data-url');
       if (u && u.startsWith('http')) fontesCopilot.push(u);
     });
 
+    // -------------------------------------------------------------------------
+    // Clona e limpa
+    // -------------------------------------------------------------------------
     const clone = caMain.cloneNode(true);
     clone.querySelectorAll([
       'script', 'style', 'noscript', 'iframe',
@@ -169,6 +193,8 @@ async () => {
       /Curtir\s*Não gosto/gi,
       /Com base em fontes/gi,
       /^\s*Saiba mais\s*$/gim,
+      /^\s*Ler tudo\s*$/gim,
+      /^\s*Read more\s*$/gim,
     ];
     for (const r of lixos) texto = texto.replace(r, '');
 
