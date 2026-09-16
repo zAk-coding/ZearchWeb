@@ -1,14 +1,13 @@
-# Imagem oficial já contém Python 3.11 + Chromium + libs do sistema
 FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
 WORKDIR /app
 
-# Instala as dependências Python
+# Aponta o Playwright para o Chromium já instalado na imagem
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia o código
 COPY . .
 
-# Render injeta $PORT automaticamente
-CMD gunicorn zearch:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1
+CMD gunicorn zearch:app --bind 0.0.0.0:$PORT --timeout 180 --workers 1 --worker-class gthread --threads 4

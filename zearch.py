@@ -7,14 +7,13 @@ import os
 import re
 import json
 import time
+import asyncio
 import psutil
 from datetime import datetime
 from urllib.parse import quote_plus
 
 from flask import Flask, request, jsonify
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
-
+from playwright.async_api import async_playwright
 
 # =============================================================================
 # CONFIGURAÇÃO GERAL
