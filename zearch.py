@@ -555,7 +555,41 @@ async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
 
         await page.wait_for_timeout(800)
 
-        # Evaluate com 2 tentativas (protege contra navegação do Bing)
+        # ---------------------------------------------------------------------
+        # 1) CLICA EM "LER TUDO" (Playwright clique real)
+        #    Bing usa acf-button-standard, que não responde a element.click()
+        # ---------------------------------------------------------------------
+        clicou_ler_tudo = False
+        try:
+            for texto in (
+                "Ler tudo",
+                "Read more",
+                "Ver mais",
+                "Mostrar mais",
+                "Show more",
+            ):
+                loc = page.locator(
+                    f"button:has-text('{texto}'):visible, "
+                    f"a:has-text('{texto}'):visible, "
+                    f"div[role='button']:has-text('{texto}'):visible"
+                ).first
+
+                if await loc.count() > 0:
+                    try:
+                        await loc.scroll_into_view_if_needed(timeout=1000)
+                        await loc.click(timeout=2000)
+                        await page.wait_for_timeout(1000)  # 1s expande
+                        clicou_ler_tudo = True
+                        log.info(f"BOOT Ler tudo clicado ({texto!r})")
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        # ---------------------------------------------------------------------
+        # 2) EXTRAI COM O JS (com 2 tentativas em caso de navegação)
+        # ---------------------------------------------------------------------
         for tentativa in range(1, 3):
             try:
                 resultado = await page.evaluate(JS_CAPTURAR)
@@ -571,7 +605,7 @@ async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
                 raise
 
         # ---------------------------------------------------------------------
-        # Foto (só se pedido)
+        # 3) FOTO
         # ---------------------------------------------------------------------
         if photo_modo == "url":
             try:
@@ -588,8 +622,6 @@ async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
                 foto_b64 = base64.b64encode(shot).decode("ascii")
             except Exception as e:
                 log.warning(f"Falha ao capturar foto (base64): {e}")
-
-        # "none" → pula direto, mais rápido
 
         if resultado is None:
             resultado = {
