@@ -1,11 +1,10 @@
 # =============================================================================
 # ZEARCH WEB - ZW-1 PROFESSIONAL
-# Servidor Flask (async) para deploy no Render
+# Servidor Flask (async) + Playwright mobile + Render-ready
 # =============================================================================
 
 import os
 import re
-import json
 import time
 import asyncio
 import psutil
@@ -16,27 +15,31 @@ from flask import Flask, request, jsonify
 from playwright.async_api import async_playwright
 
 # =============================================================================
-# CONFIGURAÇÃO
+# 1. CONFIGURAÇÃO
 # =============================================================================
 
-# Flask app (gunicorn usa `zearch:app`)
+# App Flask (gunicorn usa `zearch:app`)
 app = Flask(__name__)
 
-# Porta — Render injeta $PORT automaticamente
+# Porta injetada pelo Render
 PORT = int(os.environ.get("PORT", 5000))
 
-# Em servidor sempre headless
+# Sempre headless no servidor
 HEADLESS = True
 
-# URL base da pesquisa no Bing
+# URL base da busca no Bing
 URL_TEMPLATE = "https://www.bing.com/search?FORM=HDRSC1&q={q}"
 
-# User-Agent mobile (Pixel 7 / Android 14 / Chrome 152)
+# User-Agent mobile — Pixel 7 / Android 14 / Chrome 152
 UA_MOBILE = (
     "Mozilla/5.0 (Linux; Android 14; Pixel 7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/152.0.0.0 Mobile Safari/537.36"
 )
+
+# Viewport mobile (Pixel 7)
+VIEWPORT = {"width": 412, "height": 915}
+DEVICE_SCALE = 2.625
 
 # Cookies fixos da sessão do Bing
 COOKIES = {
@@ -55,17 +58,14 @@ BANNER = "ZEARCH WEB • ZW-1 • Professional"
 
 
 # =============================================================================
-# JS — ESTRATÉGIAS DE EXTRAÇÃO
-# Ordem:
-#   1) Copilot  → #b_mcw / #copans_container → #ca_main
-#   2) Sports   → .answer_container → #b_wpt_container → cards
-#   3) Página   → body.cloneNode(true)
+# 2. JS DE EXTRAÇÃO — roda dentro da página do Bing
+#    Ordem: Copilot → Sports → Página inteira
 # =============================================================================
 
 JS_CAPTURAR = r"""
 async () => {
   // ---------------------------------------------------------------------------
-  // 1) Copilot — resposta gerada por IA
+  // 2.1) Copilot — resposta gerada por IA
   // ---------------------------------------------------------------------------
   async function tryCopilot() {
     const wrapper =
@@ -83,6 +83,7 @@ async () => {
         !!wrapper.querySelector('.gs_secctrl, acf-thumbs-up-down-feedback, .ca_action_btn');
     if (!feedbackPronto) return null;
 
+    // Se contém bloco de esportes, não é Copilot
     if (caMain.querySelector('.bsp_mgz_schedule, .bsp_mgz_standings, #b_wpt_container')) {
       return null;
     }
@@ -125,7 +126,7 @@ async () => {
   }
 
   // ---------------------------------------------------------------------------
-  // 2) Sports — tabela de jogos
+  // 2.2) Sports — tabela de jogos
   // ---------------------------------------------------------------------------
   async function trySports() {
     const ac = document.querySelector('.answer_container');
@@ -166,6 +167,7 @@ async () => {
       } catch (e) {}
     });
 
+    // Fallback por linhas de texto
     if (jogos.length === 0) {
       const rawLines = container.innerText.split('\n')
           .map(s => s.trim()).filter(s => s !== '');
@@ -202,7 +204,7 @@ async () => {
   }
 
   // ---------------------------------------------------------------------------
-  // 3) Último recurso — página inteira
+  // 2.3) Último recurso — página inteira
   // ---------------------------------------------------------------------------
   async function tryWholePage() {
     const clone = document.body.cloneNode(true);
@@ -246,7 +248,7 @@ async () => {
   }
 
   // ---------------------------------------------------------------------------
-  // Loop: Copilot (10s) → Sports → Página
+  // 2.4) Loop: Copilot (10s) → Sports → Página
   // ---------------------------------------------------------------------------
   return await new Promise((resolve) => {
     let attempts = 0;
@@ -271,7 +273,7 @@ async () => {
 
 
 # =============================================================================
-# HELPERS
+# 3. HELPERS
 # =============================================================================
 
 
@@ -315,7 +317,7 @@ def ram_browsers_mb() -> float:
 
 
 # =============================================================================
-# NÚCLEO — versão ASYNC
+# 4. NÚCLEO — versão ASYNC com Chromium mobile
 # =============================================================================
 
 
@@ -340,16 +342,18 @@ async def abrir_browser(p):
             "--disable-backgrounding-occluded-windows",
         ],
     )
+
     context = await browser.new_context(
         user_agent=UA_MOBILE,
-        viewport={"width": 412, "height": 915},
-        device_scale_factor=2.625,
+        viewport=VIEWPORT,
+        device_scale_factor=DEVICE_SCALE,
         is_mobile=True,
         has_touch=True,
         locale="pt-BR",
         java_script_enabled=True,
     )
 
+    # Injeta cookies da sessão Bing
     await context.add_cookies(
         [
             {"name": k, "value": v, "domain": ".bing.com", "path": "/"}
@@ -363,7 +367,8 @@ async def abrir_browser(p):
 
 async def executar_pesquisa(query: str) -> dict:
     """
-    Pesquisa completa em modo async.
+    Pesquisa completa em modo async, com retry em caso de navegação
+    durante o evaluate (o Bing às vezes recarrega sozinho).
     """
     url = URL_TEMPLATE.format(q=quote_plus(query))
 
@@ -374,9 +379,50 @@ async def executar_pesquisa(query: str) -> dict:
     p = await async_playwright().start()
     browser, context, page = await abrir_browser(p)
 
+    resultado = None
+
     try:
+        # 4.1) Navega e espera a rede ficar quieta
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        resultado = await page.evaluate(JS_CAPTURAR)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+
+        # 4.2) Espera o Copilot / cards renderizarem
+        await page.wait_for_timeout(1500)
+
+        # 4.3) Roda o JS de extração com até 3 tentativas
+        for tentativa in range(1, 4):
+            try:
+                resultado = await page.evaluate(JS_CAPTURAR)
+                break
+            except Exception as e:
+                msg = str(e)
+                eh_navegacao = (
+                    "Execution context was destroyed" in msg
+                    or "navigation" in msg.lower()
+                )
+                if eh_navegacao and tentativa < 3:
+                    print(f"[retry {tentativa}/3] contexto destruído — aguardando")
+                    await page.wait_for_timeout(2000)
+                    if "bing.com/search" not in page.url:
+                        await page.goto(
+                            url, wait_until="domcontentloaded", timeout=60000
+                        )
+                        await page.wait_for_timeout(1500)
+                    continue
+                else:
+                    raise
+
+        if resultado is None:
+            resultado = {
+                "modo": "erro",
+                "text": "Contexto destruído por navegação do Bing (3 tentativas).",
+                "sources": [],
+                "jogos": [],
+            }
+
     except Exception as e:
         import traceback
 
@@ -397,6 +443,7 @@ async def executar_pesquisa(query: str) -> dict:
         except Exception:
             pass
 
+    # 4.4) Métricas
     t_total = time.time() - t_ini
     ram_fim_script = ram_atual_mb()
     sys_fim, _ = ram_sistema_mb()
@@ -428,7 +475,48 @@ async def executar_pesquisa(query: str) -> dict:
 
 
 # =============================================================================
-# ROTAS FLASK
+# 5. RESPOSTA PADRONIZADA
+# =============================================================================
+
+
+def montar_resposta(dados: dict):
+    """Monta o JSON de resposta no formato Result + Meta."""
+    if dados["modo"] == "erro":
+        return (
+            jsonify(
+                {
+                    "Result": dados["texto"],
+                    "Meta": {
+                        "query": dados["query"],
+                        "url": dados["url"],
+                        "modo": dados["modo"],
+                        "erro": True,
+                        "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    },
+                }
+            ),
+            500,
+        )
+
+    return jsonify(
+        {
+            "Result": dados["texto"],
+            "Meta": {
+                "query": dados["query"],
+                "url": dados["url"],
+                "modo": dados["modo"],
+                "chars": len(dados["texto"]),
+                "fontes": dados["fontes"],
+                "jogos": dados["jogos"],
+                "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "metricas": dados["metricas"],
+            },
+        }
+    )
+
+
+# =============================================================================
+# 6. ROTAS FLASK
 # =============================================================================
 
 
@@ -463,41 +551,8 @@ def rota_search():
             400,
         )
 
-    # Cria event loop próprio e roda a coroutine async
     dados = asyncio.run(executar_pesquisa(query))
-
-    if dados["modo"] == "erro":
-        return (
-            jsonify(
-                {
-                    "Result": dados["texto"],
-                    "Meta": {
-                        "query": dados["query"],
-                        "url": dados["url"],
-                        "modo": dados["modo"],
-                        "erro": True,
-                        "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    },
-                }
-            ),
-            500,
-        )
-
-    return jsonify(
-        {
-            "Result": dados["texto"],
-            "Meta": {
-                "query": dados["query"],
-                "url": dados["url"],
-                "modo": dados["modo"],
-                "chars": len(dados["texto"]),
-                "fontes": dados["fontes"],
-                "jogos": dados["jogos"],
-                "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "metricas": dados["metricas"],
-            },
-        }
-    )
+    return montar_resposta(dados)
 
 
 @app.route("/search", methods=["POST"])
@@ -518,43 +573,11 @@ def rota_search_post():
         )
 
     dados = asyncio.run(executar_pesquisa(query))
-
-    if dados["modo"] == "erro":
-        return (
-            jsonify(
-                {
-                    "Result": dados["texto"],
-                    "Meta": {
-                        "query": dados["query"],
-                        "url": dados["url"],
-                        "modo": dados["modo"],
-                        "erro": True,
-                        "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    },
-                }
-            ),
-            500,
-        )
-
-    return jsonify(
-        {
-            "Result": dados["texto"],
-            "Meta": {
-                "query": dados["query"],
-                "url": dados["url"],
-                "modo": dados["modo"],
-                "chars": len(dados["texto"]),
-                "fontes": dados["fontes"],
-                "jogos": dados["jogos"],
-                "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "metricas": dados["metricas"],
-            },
-        }
-    )
+    return montar_resposta(dados)
 
 
 # =============================================================================
-# ENTRYPOINT (só roda se executar direto — Render usa gunicorn)
+# 7. ENTRYPOINT (local — Render usa gunicorn)
 # =============================================================================
 
 if __name__ == "__main__":
