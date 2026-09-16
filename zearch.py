@@ -8,6 +8,7 @@ import re
 import sys
 import time
 import uuid
+import base64
 import asyncio
 import logging
 import threading
@@ -39,7 +40,7 @@ UA_MOBILE = (
 VIEWPORT = {"width": 412, "height": 915}
 DEVICE_SCALE = 2.625
 
-# Pasta onde as fotos são salvas (servida em /photos/<arquivo>)
+# Pasta das fotos (servida em /photos/<arquivo>)
 PHOTOS_DIR = Path(os.environ.get("PHOTOS_DIR", "./photos"))
 PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -64,8 +65,6 @@ BANNER = "ZEARCH WEB • ZW-1 • Professional (Flash)"
 
 
 class ColorFormatter(logging.Formatter):
-    """Formata logs com cores ANSI."""
-
     CINZA = "\033[90m"
     AZUL = "\033[94m"
     VERDE = "\033[92m"
@@ -79,7 +78,6 @@ class ColorFormatter(logging.Formatter):
     def format(self, record):
         ts = self.formatTime(record, "%H:%M:%S")
         nivel = record.levelname
-
         cores = {
             "DEBUG": self.CINZA,
             "INFO": self.AZUL,
@@ -88,16 +86,12 @@ class ColorFormatter(logging.Formatter):
             "CRITICAL": self.VERMELHO + self.BOLD,
         }
         cor = cores.get(nivel, self.RESET)
-
         msg = record.getMessage()
-
-        # Colorir palavras-chave
         msg = re.sub(r"\bREQ\b", f"{self.CIANO}REQ{self.RESET}", msg)
         msg = re.sub(r"\bRES\b", f"{self.VERDE}RES{self.RESET}", msg)
         msg = re.sub(r"\bERR\b", f"{self.VERMELHO}ERR{self.RESET}", msg)
         msg = re.sub(r"\bBOOT\b", f"{self.MAGENTA}BOOT{self.RESET}", msg)
         msg = re.sub(r"\bWARM\b", f"{self.MAGENTA}WARM{self.RESET}", msg)
-
         return f"{self.CINZA}[{ts}]{self.RESET} {cor}{nivel:<5}{self.RESET} {msg}"
 
 
@@ -122,6 +116,10 @@ def ip_do_cliente() -> str:
 
 JS_CAPTURAR = r"""
 async () => {
+
+  // ---------------------------------------------------------------------------
+  // 3.1) Copilot — resposta da IA (melhor caso)
+  // ---------------------------------------------------------------------------
   async function tryCopilot() {
     const wrapper =
         document.querySelector('#b_mcw') ||
@@ -138,7 +136,7 @@ async () => {
       return null;
     }
 
-    // Fontes: pega os <a> com data-url (citações reais do Copilot)
+    // Fontes do Copilot (citações reais)
     const fontesCopilot = [];
     wrapper.querySelectorAll('a[data-url]').forEach(a => {
       const u = a.getAttribute('data-url');
@@ -178,7 +176,6 @@ async () => {
     texto = texto.split(/Mostrar tudo\s*Referências/i)[0].trim();
     texto = texto.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
 
-    // Todas as fontes (fallback)
     const fontesTodas = [];
     wrapper.querySelectorAll('a').forEach(a => {
       const h = a.href;
@@ -194,6 +191,9 @@ async () => {
     };
   }
 
+  // ---------------------------------------------------------------------------
+  // 3.2) Sports — tabela de jogos
+  // ---------------------------------------------------------------------------
   async function trySports() {
     const ac = document.querySelector('.answer_container');
     if (!ac) return null;
@@ -228,37 +228,126 @@ async () => {
     return { modo: 'sports', text: container.innerText.trim(), fontes: [], fontes_general: [], jogos };
   }
 
+  // ---------------------------------------------------------------------------
+  // 3.3) Página inteira — LIMPEZA AGRESSIVA
+  //     (remove cards de fonte, links citados, botões, tudo que é estrutura)
+  // ---------------------------------------------------------------------------
   async function tryWholePage() {
-    const clone = document.body.cloneNode(true);
+    // Tenta partir do container mais "limpo" disponível
+    const root =
+      document.querySelector('#ca_main') ||
+      document.querySelector('#b_content main') ||
+      document.querySelector('#b_content') ||
+      document.body;
+
+    const clone = root.cloneNode(true);
+
+    // -------------------------------------------------------------------------
+    // 3.3.1) REMOÇÃO ESTRUTURAL
+    // Remove blocos inteiros que são lixo (cards, botões, cabeçalhos, etc.)
+    // -------------------------------------------------------------------------
     clone.querySelectorAll([
+      // Lixo básico
       'script', 'style', 'noscript', 'iframe', 'svg', 'head', 'meta',
       'link', 'template', 'object', 'embed', 'canvas',
       '.b_ad', '.sb_ad', '.b_adTop', '.b_adBottom',
       '.rms_img', 'img', 'video', 'audio',
       '#b_header', '#b_footer', 'header', 'nav', 'footer',
       '.b_hide', '[aria-hidden="true"]',
+
+      // Cards de fonte (contêm os textos "Wikipedia › wiki › Nobru", "forbes.com.br" etc.)
+      '.gs_cit', '.gs_cits', '.gs_cit_wrapper', '.gs_cit_cont',
+      '.gs_cit_panel', '.gs_cit_panel_content', '.gs_cit_panel_header',
+      '.bsp_cit_cont', '.b_genserp_citation_hover_md', '.cit_exp_cont',
+      '.gs_cit_exp', '.gs_cit_exp_text', '.gs_cit_src', '.gs_cit_title',
+      '.gs_cit_snippet', '.gs_cit_siteurl', '.gs_cit_title_text',
+
+      // Links citados inline no texto (Wikipedia+1, Esports.net, etc.)
+      '.gs_mdlink', '.gs_cit_txt', '.gs_sm_cit', '.gs_sup_cit',
+
+      // Botões e feedback
+      'acf-button-standard', 'acf-thumbs-up-down-feedback',
+      '.gs_secctrl', '.gs_secctrl_items', '.acf_fdbk_ph',
+      '.b_acf_answer_expansion_control', '.b_module_expansion_control',
+      '.b_acf_expansion_gradient_overlay', '.b_btnContainer',
+
+      // Avisos IA e disclaimers
+      '.gs_ai_disclaimer', '.gs_infobbl', '#gs_infobbl',
+
+      // Cabeçalhos de bloco e "ver mais"
+      '.bsp_seemore', '.bsp_seemore_start', '.bsp_seemore_cta',
+      '.mag_st_header', '.mag_header',
+      '.b_wpt_header', '.bsp_mgz_header', '.bsp_mgzhdr_btns',
+
+      // Rodapés do Copilot
+      '.b_wpt_attr', '.b_wpt_footer', '.b_gs_top_gradient', '.b_gs_bottom_cover',
     ].join(',')).forEach(el => el.remove());
 
+    // -------------------------------------------------------------------------
+    // 3.3.2) REMOÇÃO DE LINKS (mantém só o texto)
+    // Substitui cada <a> pelo seu texto puro
+    // -------------------------------------------------------------------------
+    clone.querySelectorAll('a').forEach(a => {
+      const t = (a.innerText || a.textContent || '').trim();
+      a.replaceWith(document.createTextNode(t));
+    });
+
+    // -------------------------------------------------------------------------
+    // 3.3.3) PEGA O TEXTO PURO
+    // -------------------------------------------------------------------------
     let texto = (clone.innerText || clone.textContent || '').trim();
+
+    // -------------------------------------------------------------------------
+    // 3.3.4) CORTES ESTRUTURAIS (frases-âncora do rodapé)
+    // -------------------------------------------------------------------------
+    const cortes = [
+      /Exibir tudo\s*\d*\s*Fontes/i,
+      /Continuar explorando/i,
+      /Todas as fontes/i,
+      /Mostrar tudo\s*Referências/i,
+      /Nova pesquisa/i,
+      /Experimente a Pesquisa Visual/i,
+      /Referências\s*\d+\s*fonte/i,
+      /Fontes\s*\d+/i,
+    ];
+    for (const c of cortes) {
+      texto = texto.split(c)[0];
+    }
+
+    // -------------------------------------------------------------------------
+    // 3.3.5) LIMPEZA FINA (frases soltas e lixo visual)
+    // -------------------------------------------------------------------------
     const lixos = [
+      /^\s*Leia mais\s*$/gim,
+      /^\s*Ver mais\s*$/gim,
+      /^\s*Saiba mais\s*$/gim,
+      /^\s*Feedback\s*$/gim,
+      /^\s*Exibir tudo\s*$/gim,
       /Este resumo foi gerado pela IA[^\n]*/gi,
       /Localize os links de origem[^\n]*/gi,
       /Saiba mais sobre os resultados[^\n]*/gi,
       /Curtir\s*Não gosto/gi,
       /Com base em fontes/gi,
-      /^\s*Saiba mais\s*$/gim,
-      /^\s*Veja mais\s*$/gim,
-      /^\s*Feedback\s*$/gim,
     ];
     for (const r of lixos) texto = texto.replace(r, '');
-    texto = texto.split('Nova pesquisa')[0].trim();
-    texto = texto.split('Experimente a Pesquisa Visual')[0].trim();
-    texto = texto.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+
+    // -------------------------------------------------------------------------
+    // 3.3.6) HIGIENIZAÇÃO FINAL
+    // Remove linhas em branco duplicadas e normaliza espaços
+    // -------------------------------------------------------------------------
+    texto = texto
+      .split('\n')
+      .map(l => l.replace(/[ \t]+/g, ' ').trim())
+      .filter((l, i, arr) => l.length > 0 || (i > 0 && arr[i - 1].length > 0))
+      .join('\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
 
     if (texto.length < 50) return null;
 
+    // Fontes gerais: pega os links externos ANTES de remover (do root original)
     const fontesTodas = [];
-    document.body.querySelectorAll('a').forEach(a => {
+    root.querySelectorAll('a').forEach(a => {
       const h = a.href;
       if (h && h.startsWith('http') && !h.includes('bing.com')) fontesTodas.push(h);
     });
@@ -272,15 +361,21 @@ async () => {
     };
   }
 
+  // ---------------------------------------------------------------------------
+  // 3.4) Loop: Copilot (10s) → Sports → Página
+  // ---------------------------------------------------------------------------
   return await new Promise((resolve) => {
     let attempts = 0;
     const interval = setInterval(async () => {
       attempts++;
+
       const c = await tryCopilot();
       if (c) { clearInterval(interval); resolve(c); return; }
-      if (attempts > 12) {
+
+      if (attempts > 20) {
         const s = await trySports();
         if (s) { clearInterval(interval); resolve(s); return; }
+
         const p = await tryWholePage();
         clearInterval(interval);
         resolve(p || { modo: 'nenhum', text: '', fontes: [], fontes_general: [], jogos: [] });
@@ -317,15 +412,9 @@ def ram_atual_mb() -> float:
 # =============================================================================
 # 5. EVENT LOOP PERSISTENTE
 # =============================================================================
-# O Flask + asyncio.run() cria um event loop novo a cada request, o que
-# quebra o Playwright (future loop error). Solução: rodar UM event loop
-# em thread separada e agendar as coroutines nele.
-# =============================================================================
 
 
 class LoopBackground:
-    """Event loop persistente em thread separada."""
-
     def __init__(self):
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -335,10 +424,9 @@ class LoopBackground:
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
-    def run(self, coro):
-        """Roda uma coroutine no loop e bloqueia até terminar."""
+    def run(self, coro, timeout=120):
         future = asyncio.run_coroutine_threadsafe(coro, self.loop)
-        return future.result(timeout=120)
+        return future.result(timeout=timeout)
 
 
 LOOP_BG = LoopBackground()
@@ -412,14 +500,25 @@ POOL = BrowserPool()
 # 7. NÚCLEO FLASH
 # =============================================================================
 
+# Modos válidos para o parâmetro "photo":
+#   "base64"  → devolve a imagem em base64 no JSON (string gigante)
+#   "url"     → salva PNG no servidor e devolve a URL /photos/xxx.png
+#   "none"    → não captura foto (mais rápido)
+PHOTO_MODOS = {"base64", "url", "none"}
 
-async def executar_pesquisa_flash(query: str) -> dict:
+
+async def executar_pesquisa_flash(query: str, photo_modo: str = "url") -> dict:
+    """
+    Executa a pesquisa em modo flash.
+    photo_modo: "base64" | "url" | "none"
+    """
     url = URL_TEMPLATE.format(q=quote_plus(query))
     t_ini = time.time()
 
     page = await POOL.get_page()
     resultado = None
     foto_arquivo = None
+    foto_b64 = None
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
@@ -430,6 +529,7 @@ async def executar_pesquisa_flash(query: str) -> dict:
 
         await page.wait_for_timeout(800)
 
+        # Evaluate com 2 tentativas (protege contra navegação do Bing)
         for tentativa in range(1, 3):
             try:
                 resultado = await page.evaluate(JS_CAPTURAR)
@@ -444,14 +544,26 @@ async def executar_pesquisa_flash(query: str) -> dict:
                     continue
                 raise
 
-        # Foto: salva PNG no disco
-        try:
-            nome_foto = f"{uuid.uuid4().hex}.png"
-            caminho = PHOTOS_DIR / nome_foto
-            await page.screenshot(path=str(caminho), full_page=False, type="png")
-            foto_arquivo = nome_foto
-        except Exception as e:
-            log.warning(f"Falha ao capturar foto: {e}")
+        # ---------------------------------------------------------------------
+        # Foto (só se pedido)
+        # ---------------------------------------------------------------------
+        if photo_modo == "url":
+            try:
+                nome_foto = f"{uuid.uuid4().hex}.png"
+                caminho = PHOTOS_DIR / nome_foto
+                await page.screenshot(path=str(caminho), full_page=False, type="png")
+                foto_arquivo = nome_foto
+            except Exception as e:
+                log.warning(f"Falha ao capturar foto (url): {e}")
+
+        elif photo_modo == "base64":
+            try:
+                shot = await page.screenshot(full_page=False, type="png")
+                foto_b64 = base64.b64encode(shot).decode("ascii")
+            except Exception as e:
+                log.warning(f"Falha ao capturar foto (base64): {e}")
+
+        # "none" → pula direto, mais rápido
 
         if resultado is None:
             resultado = {
@@ -490,7 +602,8 @@ async def executar_pesquisa_flash(query: str) -> dict:
         "fontes": fontes,
         "fontes_general": fontes_general,
         "jogos": jogos,
-        "foto": foto_arquivo,
+        "foto_arquivo": foto_arquivo,
+        "foto_b64": foto_b64,
         "tempo_s": round(t_total, 3),
     }
 
@@ -502,7 +615,7 @@ async def executar_pesquisa_flash(query: str) -> dict:
 
 @app.route("/photos/<path:nome>", methods=["GET"])
 def servir_foto(nome):
-    """Serve os PNGs capturados."""
+    """Serve os PNGs salvos em PHOTOS_DIR."""
     return send_from_directory(PHOTOS_DIR.resolve(), nome)
 
 
@@ -513,11 +626,16 @@ def raiz():
             "status": "ok",
             "service": BANNER,
             "endpoints": {
-                "GET /": "status",
-                "GET /search?q=<termo>": "pesquisa flash",
-                "POST /search": 'mesmo, JSON body {"q":"..."}',
-                "GET /warmup": "esquenta o Chromium",
-                "GET /photos/<file>": "foto capturada",
+                "GET  /": "status",
+                "GET  /search?q=<termo>&photo=url|base64|none": "pesquisa flash",
+                "POST /search": 'idem, JSON body {"q":"...","photo":"url"}',
+                "GET  /warmup": "esquenta o Chromium (após deploy)",
+                "GET  /photos/<file>": "baixa a foto capturada",
+            },
+            "photo_modes": {
+                "url": "salva PNG no servidor, devolve /photos/<file>",
+                "base64": "devolve string base64 no JSON",
+                "none": "não captura foto (mais rápido)",
             },
         }
     )
@@ -532,9 +650,9 @@ def warmup():
         return jsonify({"status": "erro", "erro": f"{type(e).__name__}: {e}"}), 500
 
 
-def _executar_e_responder(query: str, ip: str, t0: float):
+def _executar_e_responder(query: str, ip: str, t0: float, photo_modo: str):
     try:
-        dados = LOOP_BG.run(executar_pesquisa_flash(query))
+        dados = LOOP_BG.run(executar_pesquisa_flash(query, photo_modo))
     except Exception as e:
         log.error(f'ERR ip={ip} q="{query}" {type(e).__name__}: {e}')
         return (
@@ -556,12 +674,25 @@ def _executar_e_responder(query: str, ip: str, t0: float):
         f"RES ip={ip} q=\"{query}\" modo={dados['modo']} "
         f"chars={len(dados['texto'])} fontes={len(dados['fontes'])} "
         f"geral={len(dados['fontes_general'])} jogos={len(dados['jogos'])} "
-        f"tempo={dados['tempo_s']}s total={total}s"
+        f"photo={photo_modo} tempo={dados['tempo_s']}s total={total}s"
     )
 
-    photo_url = None
-    if dados["foto"]:
-        photo_url = f"/photos/{dados['foto']}"
+    # Monta o campo "photo" de acordo com o modo escolhido
+    photo_field = None
+    if photo_modo == "url" and dados["foto_arquivo"]:
+        photo_field = {
+            "tipo": "url",
+            "arquivo": dados["foto_arquivo"],
+            "url": f"/photos/{dados['foto_arquivo']}",
+        }
+    elif photo_modo == "base64" and dados["foto_b64"]:
+        photo_field = {
+            "tipo": "base64",
+            "mime": "image/png",
+            "conteudo": dados["foto_b64"],
+        }
+    elif photo_modo == "none":
+        photo_field = {"tipo": "none"}
 
     return jsonify(
         {
@@ -569,7 +700,7 @@ def _executar_e_responder(query: str, ip: str, t0: float):
             "fontes": dados["fontes"],
             "fontes_general": dados["fontes_general"],
             "jogos": dados["jogos"],
-            "photo": photo_url,
+            "photo": photo_field,
             "meta": {
                 "query": dados["query"],
                 "url": dados["url"],
@@ -588,13 +719,16 @@ def rota_search_get():
     t0 = time.time()
     ip = ip_do_cliente()
     query = (request.args.get("q") or "").strip()
+    photo_modo = (request.args.get("photo") or "url").lower().strip()
 
     if not query:
         log.warning(f"ERR ip={ip} GET /search sem query")
         return jsonify({"error": "Parâmetro 'q' é obrigatório"}), 400
+    if photo_modo not in PHOTO_MODOS:
+        photo_modo = "url"
 
-    log.info(f'REQ ip={ip} GET q="{query}"')
-    return _executar_e_responder(query, ip, t0)
+    log.info(f'REQ ip={ip} GET q="{query}" photo={photo_modo}')
+    return _executar_e_responder(query, ip, t0, photo_modo)
 
 
 @app.route("/search", methods=["POST"])
@@ -603,13 +737,16 @@ def rota_search_post():
     ip = ip_do_cliente()
     payload = request.get_json(silent=True) or {}
     query = (payload.get("q") or payload.get("query") or "").strip()
+    photo_modo = (payload.get("photo") or "url").lower().strip()
 
     if not query:
         log.warning(f"ERR ip={ip} POST /search sem query")
         return jsonify({"error": "Campo 'q' é obrigatório"}), 400
+    if photo_modo not in PHOTO_MODOS:
+        photo_modo = "url"
 
-    log.info(f'REQ ip={ip} POST q="{query}"')
-    return _executar_e_responder(query, ip, t0)
+    log.info(f'REQ ip={ip} POST q="{query}" photo={photo_modo}')
+    return _executar_e_responder(query, ip, t0, photo_modo)
 
 
 # =============================================================================
