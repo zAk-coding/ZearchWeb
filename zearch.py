@@ -1,23 +1,22 @@
 # =============================================================================
-# ZEARCH WEB - ZW-1 PROFESSIONAL (Flash Mode)
-# Servidor Flask (async) + Playwright mobile + Render-ready
-# - 1 modo só: Flash (rápido, sem quebrar)
-# - Browser persistente (abre uma vez, reusa entre requests)
-# - Logs detalhados por requisição (IP, query, tempo, tamanho)
-# - Foto do viewport na resposta (base64)
+# ZEARCH WEB - ZW-1 PROFESSIONAL (Flash)
+# Servidor Flask async + Playwright mobile + Render-ready
 # =============================================================================
 
 import os
 import re
+import sys
 import time
-import base64
+import uuid
 import asyncio
 import logging
+import threading
 import psutil
 from datetime import datetime
 from urllib.parse import quote_plus
+from pathlib import Path
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from playwright.async_api import async_playwright
 
 # =============================================================================
@@ -40,6 +39,10 @@ UA_MOBILE = (
 VIEWPORT = {"width": 412, "height": 915}
 DEVICE_SCALE = 2.625
 
+# Pasta onde as fotos são salvas (servida em /photos/<arquivo>)
+PHOTOS_DIR = Path(os.environ.get("PHOTOS_DIR", "./photos"))
+PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
+
 COOKIES = {
     "MUID": "1A41BE0E6A7362A90231A9916B8863E3",
     "MUIDB": "1A41BE0E6A7362A90231A9916B8863E3",
@@ -56,19 +59,57 @@ BANNER = "ZEARCH WEB • ZW-1 • Professional (Flash)"
 
 
 # =============================================================================
-# 2. LOGGING
+# 2. LOGGING COLORIDO
 # =============================================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+
+class ColorFormatter(logging.Formatter):
+    """Formata logs com cores ANSI."""
+
+    CINZA = "\033[90m"
+    AZUL = "\033[94m"
+    VERDE = "\033[92m"
+    AMARELO = "\033[93m"
+    VERMELHO = "\033[91m"
+    CIANO = "\033[96m"
+    MAGENTA = "\033[95m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+    def format(self, record):
+        ts = self.formatTime(record, "%H:%M:%S")
+        nivel = record.levelname
+
+        cores = {
+            "DEBUG": self.CINZA,
+            "INFO": self.AZUL,
+            "WARNING": self.AMARELO,
+            "ERROR": self.VERMELHO,
+            "CRITICAL": self.VERMELHO + self.BOLD,
+        }
+        cor = cores.get(nivel, self.RESET)
+
+        msg = record.getMessage()
+
+        # Colorir palavras-chave
+        msg = re.sub(r"\bREQ\b", f"{self.CIANO}REQ{self.RESET}", msg)
+        msg = re.sub(r"\bRES\b", f"{self.VERDE}RES{self.RESET}", msg)
+        msg = re.sub(r"\bERR\b", f"{self.VERMELHO}ERR{self.RESET}", msg)
+        msg = re.sub(r"\bBOOT\b", f"{self.MAGENTA}BOOT{self.RESET}", msg)
+        msg = re.sub(r"\bWARM\b", f"{self.MAGENTA}WARM{self.RESET}", msg)
+
+        return f"{self.CINZA}[{ts}]{self.RESET} {cor}{nivel:<5}{self.RESET} {msg}"
+
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(ColorFormatter())
 log = logging.getLogger("zearch")
+log.handlers = [handler]
+log.setLevel(logging.INFO)
+log.propagate = False
 
 
 def ip_do_cliente() -> str:
-    """Pega o IP real do cliente (Render usa proxy, olha X-Forwarded-For)."""
     xff = request.headers.get("X-Forwarded-For", "")
     if xff:
         return xff.split(",")[0].strip()
@@ -76,7 +117,7 @@ def ip_do_cliente() -> str:
 
 
 # =============================================================================
-# 3. JS DE EXTRAÇÃO (Flash — Copilot → Sports → Página)
+# 3. JS DE EXTRAÇÃO
 # =============================================================================
 
 JS_CAPTURAR = r"""
@@ -96,6 +137,13 @@ async () => {
     if (caMain.querySelector('.bsp_mgz_schedule, .bsp_mgz_standings, #b_wpt_container')) {
       return null;
     }
+
+    // Fontes: pega os <a> com data-url (citações reais do Copilot)
+    const fontesCopilot = [];
+    wrapper.querySelectorAll('a[data-url]').forEach(a => {
+      const u = a.getAttribute('data-url');
+      if (u && u.startsWith('http')) fontesCopilot.push(u);
+    });
 
     const clone = caMain.cloneNode(true);
     clone.querySelectorAll([
@@ -130,12 +178,20 @@ async () => {
     texto = texto.split(/Mostrar tudo\s*Referências/i)[0].trim();
     texto = texto.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
 
-    const links = Array.from(wrapper.querySelectorAll('a'))
-      .filter(a => a.href && a.href.startsWith('http') && !a.href.includes('bing.com'))
-      .map(a => a.href);
-    const sources = [...new Set(links)];
+    // Todas as fontes (fallback)
+    const fontesTodas = [];
+    wrapper.querySelectorAll('a').forEach(a => {
+      const h = a.href;
+      if (h && h.startsWith('http') && !h.includes('bing.com')) fontesTodas.push(h);
+    });
 
-    return { modo: 'copilot', text: texto, sources: sources, jogos: [] };
+    return {
+      modo: 'copilot',
+      text: texto,
+      fontes: [...new Set(fontesCopilot)],
+      fontes_general: [...new Set(fontesTodas)],
+      jogos: []
+    };
   }
 
   async function trySports() {
@@ -158,8 +214,8 @@ async () => {
         const scores = card.querySelectorAll('.bsp_team_scr');
         const placar_casa = scores[0] ? scores[0].innerText.trim() : '';
         const placar_fora = scores[1] ? scores[1].innerText.trim() : '';
-        const status = (card.querySelector('.bsp_game_info > div:first-child')?.innerText || '').trim();
-        const data = (card.querySelector('.bsp_game_time')?.innerText || '').trim();
+        const status = (card.querySelector('.game-info > div:first-child')?.innerText || '').trim();
+        const data = (card.querySelector('.game-time')?.innerText || '').trim();
         jogos.push({
           competicao, time_casa, time_fora,
           placar: `${placar_casa} - ${placar_fora}`,
@@ -169,7 +225,7 @@ async () => {
     });
 
     if (jogos.length === 0) return null;
-    return { modo: 'sports', text: container.innerText.trim(), sources: [], jogos };
+    return { modo: 'sports', text: container.innerText.trim(), fontes: [], fontes_general: [], jogos };
   }
 
   async function tryWholePage() {
@@ -201,15 +257,21 @@ async () => {
 
     if (texto.length < 50) return null;
 
-    const links = Array.from(document.body.querySelectorAll('a'))
-      .filter(a => a.href && a.href.startsWith('http') && !a.href.includes('bing.com'))
-      .map(a => a.href);
-    const sources = [...new Set(links)];
+    const fontesTodas = [];
+    document.body.querySelectorAll('a').forEach(a => {
+      const h = a.href;
+      if (h && h.startsWith('http') && !h.includes('bing.com')) fontesTodas.push(h);
+    });
 
-    return { modo: 'pagina', text: texto, sources: sources, jogos: [] };
+    return {
+      modo: 'pagina',
+      text: texto,
+      fontes: [],
+      fontes_general: [...new Set(fontesTodas)],
+      jogos: []
+    };
   }
 
-  // Flash: tenta Copilot (até 6s) → Sports → Página
   return await new Promise((resolve) => {
     let attempts = 0;
     const interval = setInterval(async () => {
@@ -221,7 +283,7 @@ async () => {
         if (s) { clearInterval(interval); resolve(s); return; }
         const p = await tryWholePage();
         clearInterval(interval);
-        resolve(p || { modo: 'nenhum', text: '', sources: [], jogos: [] });
+        resolve(p || { modo: 'nenhum', text: '', fontes: [], fontes_general: [], jogos: [] });
       }
     }, 500);
   });
@@ -252,22 +314,42 @@ def ram_atual_mb() -> float:
     return psutil.Process().memory_info().rss / 1024 / 1024
 
 
-def ram_sistema_mb():
-    vm = psutil.virtual_memory()
-    return vm.used / 1024 / 1024, vm.total / 1024 / 1024
+# =============================================================================
+# 5. EVENT LOOP PERSISTENTE
+# =============================================================================
+# O Flask + asyncio.run() cria um event loop novo a cada request, o que
+# quebra o Playwright (future loop error). Solução: rodar UM event loop
+# em thread separada e agendar as coroutines nele.
+# =============================================================================
+
+
+class LoopBackground:
+    """Event loop persistente em thread separada."""
+
+    def __init__(self):
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def run(self, coro):
+        """Roda uma coroutine no loop e bloqueia até terminar."""
+        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        return future.result(timeout=120)
+
+
+LOOP_BG = LoopBackground()
 
 
 # =============================================================================
-# 5. BROWSER PERSISTENTE (abre uma vez, reusa)
+# 6. BROWSER PERSISTENTE
 # =============================================================================
 
 
 class BrowserPool:
-    """
-    Guarda 1 browser + 1 context + 1 page abertos e os reusa entre requests.
-    Só recria se o Chromium morrer.
-    """
-
     def __init__(self):
         self._playwright = None
         self._browser = None
@@ -276,6 +358,8 @@ class BrowserPool:
         self._lock = asyncio.Lock()
 
     async def _criar(self):
+        log.info("BOOT Chromium iniciando...")
+        t0 = time.time()
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(
             headless=HEADLESS,
@@ -309,7 +393,7 @@ class BrowserPool:
             ]
         )
         self._page = await self._context.new_page()
-        log.info("BROWSER_POOL: Chromium iniciado (reuso ativado)")
+        log.info(f"BOOT Chromium pronto em {round(time.time()-t0, 2)}s")
 
     async def get_page(self):
         async with self._lock:
@@ -318,7 +402,6 @@ class BrowserPool:
             return self._page
 
     async def warmup(self):
-        """Só garante que o Chromium está aberto."""
         await self.get_page()
 
 
@@ -326,21 +409,17 @@ POOL = BrowserPool()
 
 
 # =============================================================================
-# 6. NÚCLEO FLASH
+# 7. NÚCLEO FLASH
 # =============================================================================
 
 
 async def executar_pesquisa_flash(query: str) -> dict:
-    """Modo flash: reaproveita browser, navega, extrai, tira foto."""
     url = URL_TEMPLATE.format(q=quote_plus(query))
-
     t_ini = time.time()
-    ram_ini = ram_atual_mb()
 
     page = await POOL.get_page()
-
     resultado = None
-    foto_b64 = None
+    foto_arquivo = None
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
@@ -351,7 +430,6 @@ async def executar_pesquisa_flash(query: str) -> dict:
 
         await page.wait_for_timeout(800)
 
-        # evaluate com 2 retries rápidos
         for tentativa in range(1, 3):
             try:
                 resultado = await page.evaluate(JS_CAPTURAR)
@@ -366,18 +444,21 @@ async def executar_pesquisa_flash(query: str) -> dict:
                     continue
                 raise
 
-        # Foto do viewport (sem full_page pra ser rápido)
+        # Foto: salva PNG no disco
         try:
-            shot = await page.screenshot(full_page=False, type="png")
-            foto_b64 = base64.b64encode(shot).decode("ascii")
-        except Exception:
-            foto_b64 = None
+            nome_foto = f"{uuid.uuid4().hex}.png"
+            caminho = PHOTOS_DIR / nome_foto
+            await page.screenshot(path=str(caminho), full_page=False, type="png")
+            foto_arquivo = nome_foto
+        except Exception as e:
+            log.warning(f"Falha ao capturar foto: {e}")
 
         if resultado is None:
             resultado = {
                 "modo": "erro",
                 "text": "Sem resultado",
-                "sources": [],
+                "fontes": [],
+                "fontes_general": [],
                 "jogos": [],
             }
 
@@ -388,16 +469,17 @@ async def executar_pesquisa_flash(query: str) -> dict:
         resultado = {
             "modo": "erro",
             "text": f"Falha: {type(e).__name__}: {e}",
-            "sources": [],
+            "fontes": [],
+            "fontes_general": [],
             "jogos": [],
         }
 
     t_total = time.time() - t_ini
-    ram_fim = ram_atual_mb()
 
     modo = (resultado or {}).get("modo", "nenhum")
     texto = limpar_texto((resultado or {}).get("text", "") or "")
-    fontes = (resultado or {}).get("sources", []) or []
+    fontes = (resultado or {}).get("fontes", []) or []
+    fontes_general = (resultado or {}).get("fontes_general", []) or []
     jogos = (resultado or {}).get("jogos", []) or []
 
     return {
@@ -406,16 +488,22 @@ async def executar_pesquisa_flash(query: str) -> dict:
         "modo": modo,
         "texto": texto,
         "fontes": fontes,
+        "fontes_general": fontes_general,
         "jogos": jogos,
-        "foto_b64": foto_b64,
+        "foto": foto_arquivo,
         "tempo_s": round(t_total, 3),
-        "ram_delta_mb": round(ram_fim - ram_ini, 2),
     }
 
 
 # =============================================================================
-# 7. ROTAS
+# 8. ROTAS
 # =============================================================================
+
+
+@app.route("/photos/<path:nome>", methods=["GET"])
+def servir_foto(nome):
+    """Serve os PNGs capturados."""
+    return send_from_directory(PHOTOS_DIR.resolve(), nome)
 
 
 @app.route("/", methods=["GET"])
@@ -428,7 +516,8 @@ def raiz():
                 "GET /": "status",
                 "GET /search?q=<termo>": "pesquisa flash",
                 "POST /search": 'mesmo, JSON body {"q":"..."}',
-                "GET /warmup": "esquenta o Chromium após deploy",
+                "GET /warmup": "esquenta o Chromium",
+                "GET /photos/<file>": "foto capturada",
             },
         }
     )
@@ -436,12 +525,62 @@ def raiz():
 
 @app.route("/warmup", methods=["GET"])
 def warmup():
-    """Chame isso logo após o deploy pra deixar o Chromium pronto."""
     try:
-        asyncio.run(POOL.warmup())
+        LOOP_BG.run(POOL.warmup())
         return jsonify({"status": "ok", "browser": "warm"})
     except Exception as e:
         return jsonify({"status": "erro", "erro": f"{type(e).__name__}: {e}"}), 500
+
+
+def _executar_e_responder(query: str, ip: str, t0: float):
+    try:
+        dados = LOOP_BG.run(executar_pesquisa_flash(query))
+    except Exception as e:
+        log.error(f'ERR ip={ip} q="{query}" {type(e).__name__}: {e}')
+        return (
+            jsonify(
+                {
+                    "response": f"Erro: {type(e).__name__}: {e}",
+                    "fontes": [],
+                    "fontes_general": [],
+                    "jogos": [],
+                    "photo": None,
+                    "meta": {"erro": True},
+                }
+            ),
+            500,
+        )
+
+    total = round(time.time() - t0, 2)
+    log.info(
+        f"RES ip={ip} q=\"{query}\" modo={dados['modo']} "
+        f"chars={len(dados['texto'])} fontes={len(dados['fontes'])} "
+        f"geral={len(dados['fontes_general'])} jogos={len(dados['jogos'])} "
+        f"tempo={dados['tempo_s']}s total={total}s"
+    )
+
+    photo_url = None
+    if dados["foto"]:
+        photo_url = f"/photos/{dados['foto']}"
+
+    return jsonify(
+        {
+            "response": dados["texto"],
+            "fontes": dados["fontes"],
+            "fontes_general": dados["fontes_general"],
+            "jogos": dados["jogos"],
+            "photo": photo_url,
+            "meta": {
+                "query": dados["query"],
+                "url": dados["url"],
+                "modo": dados["modo"],
+                "chars": len(dados["texto"]),
+                "tempo_s": dados["tempo_s"],
+                "ip": ip,
+                "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        }
+    )
 
 
 @app.route("/search", methods=["GET"])
@@ -451,38 +590,11 @@ def rota_search_get():
     query = (request.args.get("q") or "").strip()
 
     if not query:
-        log.warning(f"REQ ip={ip} GET /search SEM query")
+        log.warning(f"ERR ip={ip} GET /search sem query")
         return jsonify({"error": "Parâmetro 'q' é obrigatório"}), 400
 
-    log.info(f'REQ ip={ip} GET /search q="{query}"')
-
-    dados = asyncio.run(executar_pesquisa_flash(query))
-
-    log.info(
-        f"RES ip={ip} q=\"{query}\" modo={dados['modo']} "
-        f"chars={len(dados['texto'])} fontes={len(dados['fontes'])} "
-        f"jogos={len(dados['jogos'])} tempo={dados['tempo_s']}s "
-        f"total={round(time.time() - t0, 2)}s"
-    )
-
-    return jsonify(
-        {
-            "response": dados["texto"],
-            "fontes": dados["fontes"],
-            "jogos": dados["jogos"],
-            "photo": dados["foto_b64"],
-            "meta": {
-                "query": dados["query"],
-                "url": dados["url"],
-                "modo": dados["modo"],
-                "chars": len(dados["texto"]),
-                "tempo_s": dados["tempo_s"],
-                "ram_delta_mb": dados["ram_delta_mb"],
-                "ip": ip,
-                "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            },
-        }
-    )
+    log.info(f'REQ ip={ip} GET q="{query}"')
+    return _executar_e_responder(query, ip, t0)
 
 
 @app.route("/search", methods=["POST"])
@@ -493,42 +605,15 @@ def rota_search_post():
     query = (payload.get("q") or payload.get("query") or "").strip()
 
     if not query:
-        log.warning(f"REQ ip={ip} POST /search SEM query")
+        log.warning(f"ERR ip={ip} POST /search sem query")
         return jsonify({"error": "Campo 'q' é obrigatório"}), 400
 
-    log.info(f'REQ ip={ip} POST /search q="{query}"')
-
-    dados = asyncio.run(executar_pesquisa_flash(query))
-
-    log.info(
-        f"RES ip={ip} q=\"{query}\" modo={dados['modo']} "
-        f"chars={len(dados['texto'])} fontes={len(dados['fontes'])} "
-        f"jogos={len(dados['jogos'])} tempo={dados['tempo_s']}s "
-        f"total={round(time.time() - t0, 2)}s"
-    )
-
-    return jsonify(
-        {
-            "response": dados["texto"],
-            "fontes": dados["fontes"],
-            "jogos": dados["jogos"],
-            "photo": dados["foto_b64"],
-            "meta": {
-                "query": dados["query"],
-                "url": dados["url"],
-                "modo": dados["modo"],
-                "chars": len(dados["texto"]),
-                "tempo_s": dados["tempo_s"],
-                "ram_delta_mb": dados["ram_delta_mb"],
-                "ip": ip,
-                "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            },
-        }
-    )
+    log.info(f'REQ ip={ip} POST q="{query}"')
+    return _executar_e_responder(query, ip, t0)
 
 
 # =============================================================================
-# 8. ENTRYPOINT (local — Render usa gunicorn)
+# 9. ENTRYPOINT
 # =============================================================================
 
 if __name__ == "__main__":
