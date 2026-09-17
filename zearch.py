@@ -1,94 +1,50 @@
 # =============================================================================
-# ZEARCH WEB - Backend Flask (Render-ready)
-# DDG Lite → texto puro do 1º resultado
-# Resposta: JSON com campo "response" (texto pronto pra salvar em .txt)
+# ZEARCH WEB - DDG Search indetectável (curl_cffi + impersonate)
 # =============================================================================
 
-import os
 import re
 import sys
 import time
-import requests
+import random
 from datetime import datetime
 from urllib.parse import quote_plus, unquote, urlparse, parse_qs
 from bs4 import BeautifulSoup
+from curl_cffi import requests
 
-from flask import Flask, request, jsonify
 
 # =============================================================================
 # CONFIG
 # =============================================================================
 
-app = Flask(__name__)
-PORT = int(os.environ.get("PORT", 5000))
-
 DDG_URL = "https://lite.duckduckgo.com/lite/?q={q}"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/152.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Upgrade-Insecure-Requests": "1",
-}
+# User-agents variados (rotação leve)
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+]
 
-TIMEOUT = 30
+# Delay entre requests (segundos) — obrigatório pra não bloquear
+MIN_DELAY = 1.5
+MAX_DELAY = 3.0
 
+# Retry em caso de 202/429
+MAX_RETRIES = 3
+BACKOFF_BASE = 2  # 2s, 4s, 8s
 
-# =============================================================================
-# ENTIDADES
-# =============================================================================
-
-ENTIDADES = {
-    "&nbsp;": " ",
-    "&amp;": "&",
-    "&lt;": "<",
-    "&gt;": ">",
-    "&quot;": '"',
-    "&#39;": "'",
-    "&apos;": "'",
-    "&aacute;": "á",
-    "&eacute;": "é",
-    "&iacute;": "í",
-    "&oacute;": "ó",
-    "&uacute;": "ú",
-    "&atilde;": "ã",
-    "&otilde;": "õ",
-    "&ccedil;": "ç",
-    "&acirc;": "â",
-    "&ecirc;": "ê",
-    "&ocirc;": "ô",
-    "&agrave;": "à",
-    "&Aacute;": "Á",
-    "&Eacute;": "É",
-    "&Iacute;": "Í",
-    "&Oacute;": "Ó",
-    "&Uacute;": "Ú",
-    "&Atilde;": "Ã",
-    "&Otilde;": "Õ",
-    "&Ccedil;": "Ç",
-    "&#160;": " ",
-    "&#8217;": "'",
-    "&#8211;": "-",
-    "&#8212;": "—",
-    "&#8220;": '"',
-    "&#8221;": '"',
-    "&#8230;": "...",
-}
-
-
-def decodificar_entidades(s: str) -> str:
-    for ent, ch in ENTIDADES.items():
-        s = s.replace(ent, ch)
-    return s
+TIMEOUT = 15
 
 
 # =============================================================================
 # HELPERS
 # =============================================================================
+
+def esperar():
+    """Delay aleatório entre requests."""
+    delay = random.uniform(MIN_DELAY, MAX_DELAY)
+    time.sleep(delay)
 
 
 def decodificar_link_ddg(href: str) -> str:
@@ -108,120 +64,24 @@ def decodificar_link_ddg(href: str) -> str:
     return href
 
 
-def normalizar_texto(texto: str) -> str:
+def limpar_texto(texto: str) -> str:
     linhas = []
     for linha in texto.splitlines():
         linha = re.sub(r"[ \t]+", " ", linha).strip()
-        if not linha:
-            continue
-        if re.fullmatch(r"[\W_]+", linha):
-            continue
-        linhas.append(linha)
+        if linha and not re.fullmatch(r"[\W_]+", linha):
+            linhas.append(linha)
     return "\n".join(linhas)
 
 
 # =============================================================================
-# EXTRAÇÃO DE TEXTO PURO
+# EXTRAÇÃO
 # =============================================================================
 
-TAGS_REMOVER = [
-    "script",
-    "style",
-    "noscript",
-    "svg",
-    "head",
-    "meta",
-    "link",
-    "iframe",
-    "template",
-    "object",
-    "embed",
-    "canvas",
-    "header",
-    "nav",
-    "footer",
-    "aside",
-    "form",
-    "button",
-    "input",
-    "select",
-    "textarea",
-    "label",
-    "video",
-    "audio",
-    "source",
-    "track",
-    "picture",
-]
-
-CLASSES_LIXO = [
-    "ad",
-    "ads",
-    "advert",
-    "adsbygoogle",
-    "banner",
-    "sponsor",
-    "menu",
-    "nav",
-    "navbar",
-    "breadcrumb",
-    "pagination",
-    "comment",
-    "comments",
-    "social",
-    "share",
-    "disqus",
-    "footer",
-    "newsletter",
-    "cookie",
-    "gdpr",
-    "consent",
-    "sidebar",
-    "widget",
-    "related",
-    "recommend",
-    "notice",
-    "alert",
-    "popup",
-    "modal",
-]
-
-
-def extrair_texto_puro(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-
-    if soup.head:
-        soup.head.decompose()
-
-    for tag in soup(TAGS_REMOVER):
-        tag.decompose()
-
-    for classe in CLASSES_LIXO:
-        for el in soup.find_all(class_=re.compile(rf"\b{classe}\b", re.I)):
-            el.decompose()
-
-    for a in soup.find_all("a"):
-        a.replace_with(a.get_text(" ", strip=True))
-
-    for br in soup.find_all("br"):
-        br.replace_with("\n")
-
-    texto = soup.get_text("\n", strip=True)
-    texto = decodificar_entidades(texto)
-    return normalizar_texto(texto)
-
-
-# =============================================================================
-# ETAPA 1 — BUSCA NO DDG LITE
-# =============================================================================
-
-
-def extrair_resultados_ddg(html: str) -> list:
+def extrair_resultados(html: str) -> list:
     soup = BeautifulSoup(html, "html.parser")
     resultados = []
 
     links = soup.select("a.result-link")
-
     if not links:
         for a in soup.find_all("a", href=True):
             href = a["href"]
@@ -251,14 +111,12 @@ def extrair_resultados_ddg(html: str) -> list:
             if dom_el:
                 dominio = dom_el.get_text(" ", strip=True)
 
-        resultados.append(
-            {
-                "titulo": titulo,
-                "url": url,
-                "dominio": dominio,
-                "snippet": snippet,
-            }
-        )
+        resultados.append({
+            "titulo": titulo,
+            "url": url,
+            "dominio": dominio,
+            "snippet": snippet,
+        })
 
     vistos = set()
     unicos = []
@@ -269,278 +127,137 @@ def extrair_resultados_ddg(html: str) -> list:
     return unicos
 
 
+def extrair_texto_puro(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    if soup.head:
+        soup.head.decompose()
+    for tag in soup(["script", "style", "noscript", "svg", "header", "nav", "footer", "aside", "form", "button"]):
+        tag.decompose()
+    for a in soup.find_all("a"):
+        a.replace_with(a.get_text(" ", strip=True))
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+    return limpar_texto(soup.get_text("\n", strip=True))
+
+
+# =============================================================================
+# BUSCA COM RETRY
+# =============================================================================
+
 def buscar_ddg(query: str) -> dict:
+    """Faz GET no DDG Lite com curl_cffi + impersonate + retry."""
     url = DDG_URL.format(q=quote_plus(query))
-    print(f"🌐 [1/2] Buscando no DuckDuckGo Lite...")
-    print(f"       {url}")
+    print(f"🌐 Buscando: {query}")
 
-    t0 = time.time()
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
-    except requests.exceptions.RequestException as e:
-        return {"ok": False, "erro": f"{type(e).__name__}: {e}", "url": url}
+    for tentativa in range(1, MAX_RETRIES + 1):
+        try:
+            esperar()
 
-    tempo = round(time.time() - t0, 2)
-    resultados = extrair_resultados_ddg(r.text)
+            headers = {
+                "User-Agent": random.choice(USER_AGENTS),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
+                "Referer": "https://lite.duckduckgo.com/",
+            }
 
-    print(
-        f"       Status: {r.status_code}  Resultados: {len(resultados)}  "
-        f"Tempo: {tempo}s"
-    )
+            # impersonate="chrome" → imita TLS fingerprint do Chrome real
+            r = requests.get(
+                url,
+                headers=headers,
+                impersonate="chrome131",
+                timeout=TIMEOUT,
+                allow_redirects=True,
+            )
 
-    return {
-        "ok": True,
-        "query": query,
-        "url": url,
-        "status": r.status_code,
-        "html": r.text,
-        "resultados": resultados,
-        "tempo_s": tempo,
-    }
+            # 202 ou 429 = bloqueio → retry
+            if r.status_code in (202, 429):
+                print(f"   ⚠️  Status {r.status_code} (bloqueio), retry {tentativa}/{MAX_RETRIES}...")
+                time.sleep(BACKOFF_BASE ** tentativa)
+                continue
 
+            if r.status_code != 200:
+                print(f"   ⚠️  Status {r.status_code}, retry {tentativa}/{MAX_RETRIES}...")
+                time.sleep(BACKOFF_BASE ** tentativa)
+                continue
 
-# =============================================================================
-# ETAPA 2 — FETCH DO 1º LINK
-# =============================================================================
+            # Verifica se veio HTML real (não página de challenge)
+            if len(r.text) < 500:
+                print(f"   ⚠️  HTML muito curto ({len(r.text)}b), retry...")
+                time.sleep(BACKOFF_BASE ** tentativa)
+                continue
 
+            resultados = extrair_resultados(r.text)
+            if not resultados:
+                print(f"   ⚠️  0 resultados, retry {tentativa}/{MAX_RETRIES}...")
+                time.sleep(BACKOFF_BASE ** tentativa)
+                continue
 
-def fetch_pagina(url: str) -> dict:
-    print(f"🌐 [2/2] Abrindo 1º link:")
-    print(f"       {url}")
+            print(f"   ✅ Status {r.status_code}  Resultados: {len(resultados)}")
+            return {
+                "ok": True,
+                "html": r.text,
+                "resultados": resultados,
+            }
 
-    t0 = time.time()
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
-    except requests.exceptions.Timeout:
-        return {"ok": False, "erro": "Timeout", "url": url}
-    except requests.exceptions.RequestException as e:
-        return {"ok": False, "erro": f"{type(e).__name__}: {e}", "url": url}
+        except Exception as e:
+            print(f"   ⚠️  Erro: {type(e).__name__}: {e}")
+            time.sleep(BACKOFF_BASE ** tentativa)
 
-    tempo = round(time.time() - t0, 2)
-    texto = extrair_texto_puro(r.text)
-
-    print(
-        f"       Status: {r.status_code}  Bytes: {len(r.content)}  "
-        f"Texto: {len(texto)}c  Tempo: {tempo}s"
-    )
-
-    return {
-        "ok": True,
-        "url": url,
-        "url_final": r.url,
-        "status": r.status_code,
-        "html_bytes": len(r.content),
-        "texto": texto,
-        "chars": len(texto),
-        "tempo_s": tempo,
-    }
+    return {"ok": False, "erro": "Todas as tentativas falharam"}
 
 
 # =============================================================================
-# NÚCLEO — chamado pelas rotas
+# MAIN
 # =============================================================================
 
+def main():
+    if len(sys.argv) > 1:
+        query = " ".join(sys.argv[1:])
+    else:
+        query = input("🔍 Pesquisar: ").strip()
 
-def executar_busca(query: str) -> str:
-    """
-    Executa a busca completa e devolve o TEXTO FINAL (pronto pra salvar).
-    Nunca dá exceção — devolve string com o resultado ou o erro.
-    """
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not query:
+        print("❌ Nada digitado.")
+        return
 
-    # 1) Busca DDG
+    print()
+    print("=" * 70)
+    print(f"  ZEARCH • DDG Search (curl_cffi)")
+    print(f"  Query: {query}")
+    print("=" * 70)
+    print()
+
     ddg = buscar_ddg(query)
+
     if not ddg.get("ok"):
-        return f"[ERRO] Busca falhou: {ddg.get('erro')}"
+        print(f"\n❌ Falhou: {ddg.get('erro')}")
+        return
 
     resultados = ddg["resultados"]
 
-    # ---------------- CASO A: sem resultados ----------------
-    if not resultados:
-        print("⚠️  Nenhum resultado estruturado. Usando texto puro do DDG.")
-        texto_ddg = extrair_texto_puro(ddg["html"])
-        return (
-            "=" * 80
-            + "\n"
-            + "ZEARCH WEB\n"
-            + "=" * 80
-            + "\n"
-            + f"Query     : {query}\n"
-            + f"Data      : {ts}\n"
-            + f"Status    : {ddg['status']}\n"
-            + f"Fonte     : {ddg['url']}\n"
-            + "Modo      : texto puro do DDG (sem resultados estruturados)\n"
-            + "=" * 80
-            + "\n\n"
-            + texto_ddg
-            + "\n"
-        )
+    # Salva resultados
+    with open("resultado.txt", "w", encoding="utf-8") as f:
+        f.write("=" * 70 + "\n")
+        f.write("ZEARCH WEB\n")
+        f.write("=" * 70 + "\n")
+        f.write(f"Query: {query}\n")
+        f.write(f"Data : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Total: {len(resultados)}\n")
+        f.write("=" * 70 + "\n\n")
 
-    # 2) Pega 1º link
-    primeiro = resultados[0]
-    url_1 = primeiro["url"]
-
-    # 3) Fetch
-    fetch = fetch_pagina(url_1)
-
-    # Fallback: tenta próximos
-    if not fetch.get("ok") or fetch.get("chars", 0) < 100:
-        print("⚠️  1º link falhou. Tentando próximos...")
-        for r in resultados[1:6]:
-            print(f"   → {r['url'][:70]}")
-            fetch = fetch_pagina(r["url"])
-            if fetch.get("ok") and fetch.get("chars", 0) >= 100:
-                url_1 = r["url"]
-                primeiro = r
-                break
-
-    # ---------------- CASO B3: nenhum link funcionou ----------------
-    if not fetch.get("ok") or fetch.get("chars", 0) < 100:
-        print("⚠️  Nenhum link funcionou. Usando texto puro do DDG.")
-        texto_ddg = extrair_texto_puro(ddg["html"])
-        linhas = [
-            "=" * 80,
-            "ZEARCH WEB",
-            "=" * 80,
-            f"Query     : {query}",
-            f"Data      : {ts}",
-            f"Resultados: {len(resultados)}",
-            "Modo      : nenhum link acessível → texto puro do DDG",
-            "=" * 80,
-            "",
-            "RESULTADOS DA BUSCA",
-            "=" * 80,
-            "",
-        ]
         for i, r in enumerate(resultados, 1):
-            linhas.append(f"[{i}] {r['titulo']}")
-            linhas.append(f"    {r['url']}")
+            f.write(f"[{i}] {r['titulo']}\n")
+            f.write(f"    {r['url']}\n")
             if r.get("snippet"):
-                linhas.append(f"    {r['snippet']}")
-            linhas.append("")
-        linhas.append("=" * 80)
-        linhas.append("TEXTO PURO DO DDG (fallback)")
-        linhas.append("=" * 80)
-        linhas.append("")
-        linhas.append(texto_ddg)
-        return "\n".join(linhas)
+                f.write(f"    {r['snippet']}\n")
+            f.write("\n")
 
-    # ---------------- CASO B4: sucesso ----------------
-    linhas = [
-        "=" * 80,
-        "ZEARCH WEB",
-        "=" * 80,
-        f"Query     : {query}",
-        f"Data      : {ts}",
-        f"Resultados: {len(resultados)}",
-        f"Fonte     : {url_1}",
-        "=" * 80,
-        "",
-        "RESULTADOS DA BUSCA",
-        "=" * 80,
-        "",
-    ]
-    for i, r in enumerate(resultados, 1):
-        linhas.append(f"[{i}] {r['titulo']}")
-        linhas.append(f"    {r['url']}")
-        if r.get("snippet"):
-            linhas.append(f"    {r['snippet']}")
-        linhas.append("")
-
-    linhas.append("")
-    linhas.append("=" * 80)
-    linhas.append(f"RESULTADOS DO LINK: {url_1}")
-    linhas.append("=" * 80)
-    linhas.append("")
-    linhas.append(fetch["texto"])
-
-    return "\n".join(linhas)
-
-
-# =============================================================================
-# ROTAS FLASK
-# =============================================================================
-
-
-@app.route("/", methods=["GET"])
-def raiz():
-    return jsonify(
-        {
-            "status": "ok",
-            "service": "ZEARCH WEB",
-            "endpoints": {
-                "GET  /": "status",
-                "GET  /search?q=<termo>": "busca e devolve texto em 'response'",
-                "POST /search": 'idem, JSON body {"q":"..."}',
-            },
-        }
-    )
-
-
-@app.route("/search", methods=["GET"])
-def rota_search_get():
-    query = (request.args.get("q") or "").strip()
-    if not query:
-        return jsonify({"error": "Parâmetro 'q' é obrigatório"}), 400
-
+    print(f"\n💾 Salvo em resultado.txt ({len(resultados)} resultados)")
     print()
-    print("=" * 80)
-    print(f"REQ GET /search?q={query}")
-    print("=" * 80)
+    for i, r in enumerate(resultados[:5], 1):
+        print(f"[{i}] {r['titulo'][:70]}")
+        print(f"    {r['url']}")
 
-    t0 = time.time()
-    texto = executar_busca(query)
-    total = round(time.time() - t0, 2)
-
-    print(f"✅ FIM  ({total}s, {len(texto)} chars)")
-
-    return jsonify(
-        {
-            "response": texto,
-            "meta": {
-                "query": query,
-                "chars": len(texto),
-                "tempo_s": total,
-                "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            },
-        }
-    )
-
-
-@app.route("/search", methods=["POST"])
-def rota_search_post():
-    payload = request.get_json(silent=True) or {}
-    query = (payload.get("q") or payload.get("query") or "").strip()
-    if not query:
-        return jsonify({"error": "Campo 'q' é obrigatório no JSON"}), 400
-
-    print()
-    print("=" * 80)
-    print(f"REQ POST /search q={query}")
-    print("=" * 80)
-
-    t0 = time.time()
-    texto = executar_busca(query)
-    total = round(time.time() - t0, 2)
-
-    print(f"✅ FIM  ({total}s, {len(texto)} chars)")
-
-    return jsonify(
-        {
-            "response": texto,
-            "meta": {
-                "query": query,
-                "chars": len(texto),
-                "tempo_s": total,
-                "capturado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            },
-        }
-    )
-
-
-# =============================================================================
-# ENTRYPOINT
-# =============================================================================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    main()
