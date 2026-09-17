@@ -1,5 +1,4 @@
 flask==3.0.3
-playwright==1.47.0
+requests==2.32.3
 beautifulsoup4==4.12.3
-psutil==6.0.0
 gunicorn==22.0.0
