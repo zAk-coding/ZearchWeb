@@ -1,5 +1,5 @@
 # =============================================================================
-# ZEARCH WEB - Backend Flask robusto (multi-engine + cache + memória)
+# ZEARCH WEB - Backend Flask robusto (multi-engine + proxy rotation + cache)
 # =============================================================================
 
 import os
@@ -18,9 +18,6 @@ from curl_cffi import requests as curl_requests
 
 from flask import Flask, request, jsonify
 
-# -----------------------------------------------------------------------------
-# optional: duckduckgo-search (fallback extra). Não quebra se não estiver instalado
-# -----------------------------------------------------------------------------
 try:
     from duckduckgo_search import DDGS
 
@@ -37,7 +34,6 @@ except Exception:
 app = Flask(__name__)
 PORT = int(os.environ.get("PORT", 5000))
 
-# --- HTTP ---
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
@@ -47,42 +43,124 @@ USER_AGENTS = [
 
 IMPERSONATES = ["chrome131", "chrome124", "chrome120", "safari17_0"]
 
-# Budget total para UMA busca (todos os engines + retries). O Gunicorn está em 120s.
-ORCAMENTO_BUSCA_S = 25.0
+ORCAMENTO_BUSCA_S = 30.0
+TIMEOUT_HTTP = 8
+MAX_TENTATIVAS = 2
+BACKOFF_MAX_S = 2.0
 
-# Por-tentativa HTTP
-TIMEOUT_HTTP = 6  # cada request individual
-MAX_TENTATIVAS = 2  # por engine
-BACKOFF_MAX_S = 2.0  # teto do sleep entre retries
-
-# Cache
-CACHE_TTL_S = 300  # 5 min
+CACHE_TTL_S = 300
 CACHE_MAX_ITENS = 200
 
-# --- Memória ---
 DB_PATH = Path(os.environ.get("ZEARCH_DB", "database.json"))
 DB_LOCK = threading.Lock()
 JANELA_RECENTES_SEGUNDOS = 5 * 60
 
 
 # =============================================================================
-# UTILITÁRIOS GERAIS
+# PROXIES — rotação + health check temporário
+# =============================================================================
+
+# Lista default (do que você passou). Pode sobrescrever via env PROXIES="host:port:user:pass\n..."
+_PROXIES_DEFAULT = """
+31.59.20.176:6754:vkxmthnf:bmq3z16z07nt
+45.38.107.97:6014:vkxmthnf:bmq3z16z07nt
+198.105.121.200:6462:vkxmthnf:bmq3z16z07nt
+64.137.96.74:6641:vkxmthnf:bmq3z16z07nt
+198.23.243.226:6361:vkxmthnf:bmq3z16z07nt
+38.154.185.97:6370:vkxmthnf:bmq3z16z07nt
+84.247.60.125:6095:vkxmthnf:bmq3z16z07nt
+142.111.67.146:5611:vkxmthnf:bmq3z16z07nt
+191.96.254.138:6185:vkxmthnf:bmq3z16z07nt
+31.58.9.4:6077:vkxmthnf:bmq3z16z07nt
+""".strip()
+
+
+def _parse_proxies(texto: str):
+    """Aceita linhas 'host:port:user:pass' ou 'host:port' ou 'http://...'."""
+    out = []
+    for linha in texto.splitlines():
+        linha = linha.strip()
+        if not linha or linha.startswith("#"):
+            continue
+        if (
+            linha.startswith("http://")
+            or linha.startswith("https://")
+            or linha.startswith("socks")
+        ):
+            out.append(linha)
+            continue
+        partes = linha.split(":")
+        if len(partes) == 4:
+            host, porta, user, senha = partes
+            out.append(f"http://{user}:{senha}@{host}:{porta}")
+        elif len(partes) == 2:
+            host, porta = partes
+            out.append(f"http://{host}:{porta}")
+    return out
+
+
+class PoolProxies:
+    """Pool com blacklist temporária para proxies que falharam."""
+
+    BAN_SEGUNDOS = 180  # proxy fica "de castigo" por 3 min após falhar
+
+    def __init__(self, lista):
+        self._todos = list(lista)
+        self._ruins = {}  # proxy -> timestamp de quando pode voltar
+        self._lock = threading.Lock()
+
+    def todos(self):
+        return list(self._todos)
+
+    def disponiveis(self):
+        agora = time.time()
+        with self._lock:
+            # limpa expirados
+            self._ruins = {p: t for p, t in self._ruins.items() if t > agora}
+            bons = [p for p in self._todos if p not in self._ruins]
+        return bons
+
+    def marcar_ruim(self, proxy: str):
+        if not proxy:
+            return
+        with self._lock:
+            self._ruins[proxy] = time.time() + self.BAN_SEGUNDOS
+
+    def aleatorio(self):
+        bons = self.disponiveis()
+        if not bons:
+            # se todos estiverem banidos, libera geral (tenta de novo)
+            with self._lock:
+                self._ruins.clear()
+            bons = list(self._todos)
+        return random.choice(bons) if bons else None
+
+
+_texto_proxies = os.environ.get("PROXIES", "").strip() or _PROXIES_DEFAULT
+_lista_proxies = _parse_proxies(_texto_proxies)
+POOL = PoolProxies(_lista_proxies)
+
+_log_inicial = f"[ZEARCH] Proxies carregados: {len(_lista_proxies)}"
+
+
+# =============================================================================
+# HELPERS
 # =============================================================================
 
 
-def _agora() -> datetime:
+def _agora():
     return datetime.now()
 
 
-def _iso(dt: datetime) -> str:
+def _iso(dt):
     return dt.isoformat(timespec="seconds")
 
 
-def _hash_query(q: str) -> str:
+def _hash_query(q):
     return hashlib.sha1(q.strip().lower().encode("utf-8")).hexdigest()
 
 
-def _log(msg: str):
+def _log(msg):
     try:
         print(msg, flush=True)
     except Exception:
@@ -90,17 +168,14 @@ def _log(msg: str):
 
 
 # =============================================================================
-# DATABASE (memória persistente)
+# DATABASE
 # =============================================================================
 
 
-def db_carregar() -> dict:
+def db_carregar():
     if not DB_PATH.exists():
         return {
-            "meta": {
-                "criado_em": _iso(_agora()),
-                "ultima_atualizacao": _iso(_agora()),
-            },
+            "meta": {"criado_em": _iso(_agora()), "ultima_atualizacao": _iso(_agora())},
             "historico": [],
             "recentes": [],
         }
@@ -110,7 +185,7 @@ def db_carregar() -> dict:
         return {"meta": {}, "historico": [], "recentes": []}
 
 
-def db_salvar(db: dict):
+def db_salvar(db):
     db.setdefault("meta", {})
     db["meta"]["ultima_atualizacao"] = _iso(_agora())
     ordenado = {
@@ -127,16 +202,17 @@ def db_salvar(db: dict):
 
 
 def db_limpar():
-    db = {
-        "meta": {"criado_em": _iso(_agora()), "ultima_atualizacao": _iso(_agora())},
-        "historico": [],
-        "recentes": [],
-    }
-    db_salvar(db)
+    db_salvar(
+        {
+            "meta": {"criado_em": _iso(_agora()), "ultima_atualizacao": _iso(_agora())},
+            "historico": [],
+            "recentes": [],
+        }
+    )
     return db
 
 
-def tempo_relativo(iso_str: str) -> str:
+def tempo_relativo(iso_str):
     try:
         quando = datetime.fromisoformat(iso_str)
     except Exception:
@@ -151,7 +227,7 @@ def tempo_relativo(iso_str: str) -> str:
     return f"há {secs // 86400} dias"
 
 
-def _atualizar_recentes(db: dict):
+def _atualizar_recentes(db):
     agora = _agora()
     ficam, vao = [], []
     for item in db.get("recentes", []):
@@ -169,7 +245,7 @@ def _atualizar_recentes(db: dict):
     db["recentes"] = ficam
 
 
-def registrar_pergunta(pergunta: str) -> dict:
+def registrar_pergunta(pergunta):
     with DB_LOCK:
         db = db_carregar()
         _atualizar_recentes(db)
@@ -186,7 +262,7 @@ def registrar_pergunta(pergunta: str) -> dict:
     return item
 
 
-def registrar_resposta(pergunta_id: int, resposta: str):
+def registrar_resposta(pergunta_id, resposta):
     with DB_LOCK:
         db = db_carregar()
         for lista in ("recentes", "historico"):
@@ -198,7 +274,7 @@ def registrar_resposta(pergunta_id: int, resposta: str):
         db_salvar(db)
 
 
-def Relembrar(pergunta_atual: str) -> str:
+def Relembrar(pergunta_atual):
     with DB_LOCK:
         db = db_carregar()
         _atualizar_recentes(db)
@@ -240,18 +316,18 @@ def Relembrar(pergunta_atual: str) -> str:
 
 
 # =============================================================================
-# CACHE EM MEMÓRIA (evita re-buscar a mesma query)
+# CACHE
 # =============================================================================
 
 
 class CacheLRU:
-    def __init__(self, ttl_s: int, max_itens: int):
+    def __init__(self, ttl_s, max_itens):
         self.ttl = ttl_s
         self.max = max_itens
         self._d = {}
         self._lock = threading.Lock()
 
-    def get(self, chave: str):
+    def get(self, chave):
         with self._lock:
             item = self._d.get(chave)
             if not item:
@@ -262,10 +338,9 @@ class CacheLRU:
                 return None
             return valor
 
-    def set(self, chave: str, valor):
+    def set(self, chave, valor):
         with self._lock:
             if len(self._d) >= self.max:
-                # remove o mais antigo (aproximação)
                 try:
                     mais_antigo = min(self._d.items(), key=lambda kv: kv[1][1])[0]
                     self._d.pop(mais_antigo, None)
@@ -278,13 +353,86 @@ CACHE = CacheLRU(CACHE_TTL_S, CACHE_MAX_ITENS)
 
 
 # =============================================================================
-# ENGINE 1 — DDG LITE via curl_cffi
+# REQUEST HTTP com rotação de proxy
+# =============================================================================
+
+
+def _http_request(url, method="GET", headers=None, data=None, deadline=None):
+    """
+    Tenta a request com proxy rotativo.
+    Retorna (response, proxy_usado) ou (None, None) em caso de falha total.
+    """
+    proxies_para_tentar = []
+
+    # monta a fila de proxies: aleatórios + 1 tentativa final sem proxy
+    vistos = set()
+    for _ in range(min(3, len(POOL.disponiveis()) or 1)):
+        p = POOL.aleatorio()
+        if p and p not in vistos:
+            vistos.add(p)
+            proxies_para_tentar.append(p)
+
+    if not proxies_para_tentar:
+        proxies_para_tentar = [None]  # sem proxy
+
+    # por último, tenta sem proxy se ainda não tentou
+    if None not in proxies_para_tentar:
+        proxies_para_tentar.append(None)
+
+    for proxy in proxies_para_tentar:
+        if deadline and time.time() > deadline:
+            _log("      ⏱️  deadline atingido, abortando request")
+            return None, None
+
+        try:
+            kwargs = {
+                "headers": headers or {},
+                "impersonate": random.choice(IMPERSONATES),
+                "timeout": TIMEOUT_HTTP,
+                "allow_redirects": True,
+            }
+            if proxy:
+                kwargs["proxy"] = proxy
+
+            if method == "GET":
+                r = curl_requests.get(url, **kwargs)
+            else:
+                r = curl_requests.post(url, data=data or {}, **kwargs)
+
+            tag = "proxy" if proxy else "direto"
+            if proxy:
+                # mostra só o IP:porta pra não vazar credencial no log
+                try:
+                    ip_port = proxy.split("@")[-1]
+                except Exception:
+                    ip_port = "?"
+                tag = f"proxy {ip_port}"
+            _log(f"      ↳ {r.status_code} via {tag} ({len(r.text)}b)")
+            return r, proxy
+
+        except Exception as e:
+            msg = str(e)[:100]
+            tag = "direto"
+            if proxy:
+                try:
+                    tag = f"proxy {proxy.split('@')[-1]}"
+                    POOL.marcar_ruim(proxy)
+                except Exception:
+                    tag = "proxy"
+            _log(f"      ✗ falhou em {tag}: {type(e).__name__} {msg}")
+            continue
+
+    return None, None
+
+
+# =============================================================================
+# ENGINE 1 — DDG LITE
 # =============================================================================
 
 DDG_LITE_URL = "https://lite.duckduckgo.com/lite/?q={q}"
 
 
-def _decodificar_link(href: str) -> str:
+def _decodificar_link(href):
     if not href:
         return ""
     if href.startswith("//"):
@@ -301,14 +449,13 @@ def _decodificar_link(href: str) -> str:
     return href
 
 
-def _extrair_resultados_lite(html: str) -> list:
+def _extrair_resultados_lite(html):
     soup = BeautifulSoup(html, "html.parser")
     resultados = []
     links = soup.select("a.result-link")
     if not links:
         for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if href.startswith("http") and "duckduckgo" not in href:
+            if a["href"].startswith("http") and "duckduckgo" not in a["href"]:
                 links.append(a)
 
     for a in links:
@@ -339,53 +486,45 @@ def _extrair_resultados_lite(html: str) -> list:
     return unicos
 
 
-def _buscar_ddg_lite(query: str, deadline: float) -> list:
+def _buscar_ddg_lite(query, deadline):
     url = DDG_LITE_URL.format(q=quote_plus(query))
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         if time.time() > deadline:
             _log("   ⏱️  ddg-lite: orçamento esgotado")
             return []
-        try:
-            headers = {
-                "User-Agent": random.choice(USER_AGENTS),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
-                "Referer": "https://lite.duckduckgo.com/",
-            }
-            r = curl_requests.get(
-                url,
-                headers=headers,
-                impersonate=random.choice(IMPERSONATES),
-                timeout=TIMEOUT_HTTP,
-                allow_redirects=True,
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
+            "Referer": "https://lite.duckduckgo.com/",
+        }
+        r, _ = _http_request(url, "GET", headers=headers, deadline=deadline)
+        if r is None:
+            continue
+        if r.status_code in (202, 429) or len(r.text) < 500:
+            _log(
+                f"   ⚠️  ddg-lite status {r.status_code} / {len(r.text)}b (tent {tentativa})"
             )
-            if r.status_code in (202, 429) or len(r.text) < 500:
-                _log(
-                    f"   ⚠️  ddg-lite {r.status_code} / {len(r.text)}b tent {tentativa}"
-                )
-                time.sleep(min(BACKOFF_MAX_S, 0.8 * tentativa))
-                continue
-            res = _extrair_resultados_lite(r.text)
-            if not res:
-                _log(f"   ⚠️  ddg-lite 0 resultados tent {tentativa}")
-                time.sleep(min(BACKOFF_MAX_S, 0.8 * tentativa))
-                continue
-            _log(f"   ✅ ddg-lite {len(res)} resultados")
-            return res
-        except Exception as e:
-            _log(f"   ⚠️  ddg-lite {type(e).__name__}: {str(e)[:120]}")
             time.sleep(min(BACKOFF_MAX_S, 0.8 * tentativa))
+            continue
+        res = _extrair_resultados_lite(r.text)
+        if not res:
+            _log(f"   ⚠️  ddg-lite 0 resultados (tent {tentativa})")
+            time.sleep(min(BACKOFF_MAX_S, 0.8 * tentativa))
+            continue
+        _log(f"   ✅ ddg-lite {len(res)} resultados")
+        return res
     return []
 
 
 # =============================================================================
-# ENGINE 2 — DDG HTML via curl_cffi
+# ENGINE 2 — DDG HTML
 # =============================================================================
 
 DDG_HTML_URL = "https://html.duckduckgo.com/html/?q={q}"
 
 
-def _extrair_resultados_html(html: str) -> list:
+def _extrair_resultados_html(html):
     soup = BeautifulSoup(html, "html.parser")
     out = []
     for div in soup.select(".result, .web-result"):
@@ -398,11 +537,10 @@ def _extrair_resultados_html(html: str) -> list:
             continue
         sn = div.select_one(".result__snippet")
         snippet = sn.get_text(" ", strip=True) if sn else ""
-        dom = ""
         try:
             dom = urlparse(url).netloc
         except Exception:
-            pass
+            dom = ""
         out.append({"titulo": titulo, "url": url, "dominio": dom, "snippet": snippet})
     vistos, unicos = set(), []
     for r in out:
@@ -412,57 +550,53 @@ def _extrair_resultados_html(html: str) -> list:
     return unicos
 
 
-def _buscar_ddg_html(query: str, deadline: float) -> list:
+def _buscar_ddg_html(query, deadline):
     url = DDG_HTML_URL.format(q=quote_plus(query))
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         if time.time() > deadline:
             return []
-        try:
-            headers = {
-                "User-Agent": random.choice(USER_AGENTS),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
-                "Referer": "https://duckduckgo.com/",
-            }
-            r = curl_requests.post(
-                url,
-                headers=headers,
-                data={"q": query, "b": ""},
-                impersonate=random.choice(IMPERSONATES),
-                timeout=TIMEOUT_HTTP,
-                allow_redirects=True,
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
+            "Referer": "https://duckduckgo.com/",
+        }
+        r, _ = _http_request(
+            url, "POST", headers=headers, data={"q": query, "b": ""}, deadline=deadline
+        )
+        if r is None:
+            continue
+        if r.status_code in (202, 429) or len(r.text) < 500:
+            _log(
+                f"   ⚠️  ddg-html status {r.status_code} / {len(r.text)}b (tent {tentativa})"
             )
-            if r.status_code in (202, 429) or len(r.text) < 500:
-                _log(
-                    f"   ⚠️  ddg-html {r.status_code} / {len(r.text)}b tent {tentativa}"
-                )
-                time.sleep(min(BACKOFF_MAX_S, 0.8 * tentativa))
-                continue
-            res = _extrair_resultados_html(r.text)
-            if not res:
-                _log(f"   ⚠️  ddg-html 0 resultados tent {tentativa}")
-                time.sleep(min(BACKOFF_MAX_S, 0.8 * tentativa))
-                continue
-            _log(f"   ✅ ddg-html {len(res)} resultados")
-            return res
-        except Exception as e:
-            _log(f"   ⚠️  ddg-html {type(e).__name__}: {str(e)[:120]}")
             time.sleep(min(BACKOFF_MAX_S, 0.8 * tentativa))
+            continue
+        res = _extrair_resultados_html(r.text)
+        if not res:
+            _log(f"   ⚠️  ddg-html 0 resultados (tent {tentativa})")
+            time.sleep(min(BACKOFF_MAX_S, 0.8 * tentativa))
+            continue
+        _log(f"   ✅ ddg-html {len(res)} resultados")
+        return res
     return []
 
 
 # =============================================================================
-# ENGINE 3 — duckduckgo_search (biblioteca, se disponível)
+# ENGINE 3 — duckduckgo_search (biblioteca)
 # =============================================================================
 
 
-def _buscar_ddgs(query: str, deadline: float) -> list:
-    if not _TEM_DDGS:
+def _buscar_ddgs(query, deadline):
+    if not _TEM_DDGS or time.time() > deadline:
         return []
-    if time.time() > deadline:
-        return []
+    # tenta com proxy também
+    proxy = POOL.aleatorio()
     try:
-        with DDGS(timeout=TIMEOUT_HTTP) as ddgs:
+        kwargs = {"timeout": TIMEOUT_HTTP}
+        if proxy:
+            kwargs["proxy"] = proxy
+        with DDGS(**kwargs) as ddgs:
             res = list(ddgs.text(query, region="br-pt", max_results=10))
         out = []
         for r in res:
@@ -482,20 +616,17 @@ def _buscar_ddgs(query: str, deadline: float) -> list:
         return out
     except Exception as e:
         _log(f"   ⚠️  ddgs {type(e).__name__}: {str(e)[:120]}")
+        if proxy:
+            POOL.marcar_ruim(proxy)
         return []
 
 
 # =============================================================================
-# ORQUESTRADOR DE BUSCA (com fallback e cache)
+# ORQUESTRADOR
 # =============================================================================
 
 
-def buscar(query: str) -> dict:
-    """
-    Retorna:
-      {"ok": bool, "resultados": [...], "engine": "ddg-lite|ddg-html|ddgs|none",
-       "erro": str|None, "cache": bool}
-    """
+def buscar(query):
     chave = _hash_query(query)
     cacheado = CACHE.get(chave)
     if cacheado:
@@ -503,7 +634,10 @@ def buscar(query: str) -> dict:
         return {**cacheado, "cache": True}
 
     deadline = time.time() + ORCAMENTO_BUSCA_S
-    _log(f"🌐 Buscando: {query}  (orçamento {ORCAMENTO_BUSCA_S}s)")
+    disponiveis = POOL.disponiveis()
+    _log(
+        f"🌐 Buscando: {query}  (orçamento {ORCAMENTO_BUSCA_S}s, proxies vivos: {len(disponiveis)}/{len(POOL.todos())})"
+    )
 
     tentativas = [
         ("ddg-lite", _buscar_ddg_lite),
@@ -529,33 +663,17 @@ def buscar(query: str) -> dict:
         "ok": False,
         "resultados": [],
         "engine": "none",
-        "erro": "Nenhuma engine retornou resultados (timeout/bloqueio).",
+        "erro": "Nenhuma engine retornou resultados (proxy/timeout/bloqueio).",
         "cache": False,
     }
 
 
 # =============================================================================
-# PROMPT
-# =============================================================================
-
-PROMPT_SISTEMA = """Você é o ZEARCH, um assistente conversacional com MEMÓRIA PERSISTENTE.
-
-REGRAS:
-1. Você recebe três blocos: CONVERSAS RECENTES, HISTÓRICO e PERGUNTA ATUAL.
-2. Cada item tem tempo relativo entre colchetes ([há 3 segundos], [há 2 minutos]).
-3. Foque na PERGUNTA ATUAL. Use o contexto para manter coerência.
-4. NUNCA cite literalmente o contexto. Responda naturalmente.
-5. Se o contexto não tiver nada relevante, apenas responda normalmente.
-6. Estilo: direto, natural, sem enrolação.
-"""
-
-
-# =============================================================================
-# FORMATAÇÃO DE TEXTO (para resposta)
+# FORMATAÇÃO
 # =============================================================================
 
 
-def _formatar_resultados(query: str, resultados: list, engine: str) -> str:
+def _formatar_resultados(query, resultados, engine):
     linhas = [
         "=" * 70,
         "ZEARCH WEB",
@@ -576,7 +694,7 @@ def _formatar_resultados(query: str, resultados: list, engine: str) -> str:
     return "\n".join(linhas)
 
 
-def _texto_amigavel_falha(query: str, erro: str) -> str:
+def _texto_amigavel_falha(query, erro):
     return "\n".join(
         [
             "=" * 70,
@@ -589,7 +707,7 @@ def _texto_amigavel_falha(query: str, erro: str) -> str:
             "⚠️  Não foi possível buscar agora.",
             f"Motivo: {erro}",
             "",
-            "Isso normalmente é bloqueio temporário do provedor de busca.",
+            "Isso normalmente é bloqueio temporário do provedor.",
             "Tente novamente em alguns segundos.",
         ]
     )
@@ -606,19 +724,22 @@ def raiz():
         {
             "status": "ok",
             "service": "ZEARCH WEB",
-            "endpoints": {
-                "GET  /search?q=<termo>": "busca no DDG",
-                "GET  /perguntar?q=<termo>": "busca + memória (contexto)",
-                "POST /perguntar": "idem, body {q}",
-                "GET  /relembrar?q=<termo>": "só o contexto montado (debug)",
-                "POST /limpar": "zera o histórico",
-                "GET  /health": "ping",
-            },
-            "engines_disponiveis": [
+            "proxies_total": len(POOL.todos()),
+            "proxies_vivos": len(POOL.disponiveis()),
+            "engines": [
                 "ddg-lite",
                 "ddg-html",
-                "ddgs" if _TEM_DDGS else "ddgs (indisponível)",
+                "ddgs" if _TEM_DDGS else "ddgs(indisponível)",
             ],
+            "endpoints": {
+                "GET  /search?q=<termo>": "busca no DDG",
+                "GET  /perguntar?q=<termo>": "busca + memória",
+                "POST /perguntar": "idem, body {q}",
+                "GET  /relembrar?q=<termo>": "contexto (debug)",
+                "POST /limpar": "zera histórico",
+                "GET  /health": "ping",
+                "GET  /proxies": "status dos proxies",
+            },
         }
     )
 
@@ -626,6 +747,34 @@ def raiz():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "ts": _iso(_agora())})
+
+
+@app.route("/proxies", methods=["GET"])
+def rota_proxies():
+    """Mostra status dos proxies (sem vazar credenciais)."""
+    agora = time.time()
+    with POOL._lock:
+        ruins = {p: t for p, t in POOL._ruins.items() if t > agora}
+
+    def _safe(p):
+        if not p:
+            return "direto"
+        try:
+            return p.split("@")[-1]
+        except Exception:
+            return "?"
+
+    return jsonify(
+        {
+            "total": len(POOL.todos()),
+            "vivos": len(POOL.disponiveis()),
+            "banidos_temporariamente": [
+                {"proxy": _safe(p), "libera_em_s": int(t - agora)}
+                for p, t in ruins.items()
+            ],
+            "lista": [_safe(p) for p in POOL.todos()],
+        }
+    )
 
 
 @app.route("/search", methods=["GET"])
@@ -652,11 +801,12 @@ def rota_search():
     total = round(time.time() - t0, 2)
 
     if not r["ok"]:
-        texto = _texto_amigavel_falha(query, r.get("erro", "desconhecido"))
         return (
             jsonify(
                 {
-                    "response": texto,
+                    "response": _texto_amigavel_falha(
+                        query, r.get("erro", "desconhecido")
+                    ),
                     "meta": {
                         "query": query,
                         "tempo_s": total,
@@ -673,7 +823,6 @@ def rota_search():
     _log(
         f"✅ FIM ({total}s, {len(texto)} chars, engine={r['engine']}, cache={r.get('cache')})"
     )
-
     return jsonify(
         {
             "response": texto,
@@ -707,7 +856,7 @@ def rota_perguntar_post():
     return _processar(pergunta)
 
 
-def _processar(pergunta: str):
+def _processar(pergunta):
     t0 = time.time()
     try:
         item = registrar_pergunta(pergunta)
@@ -741,14 +890,13 @@ def _processar(pergunta: str):
     except Exception as e:
         _log(f"⚠️  registrar_resposta falhou: {e}")
 
-    total = round(time.time() - t0, 2)
     return jsonify(
         {
             "response": resposta,
             "meta": {
                 "pergunta_id": item["id"],
                 "pergunta": pergunta,
-                "tempo_s": total,
+                "tempo_s": round(time.time() - t0, 2),
                 "ok": r["ok"],
                 "engine": r.get("engine"),
                 "capturado_em": _agora().strftime("%Y-%m-%d %H:%M:%S"),
@@ -780,5 +928,5 @@ def rota_limpar():
 # =============================================================================
 
 if __name__ == "__main__":
-    # Apenas para dev local. Em produção use gunicorn.
+    _log(_log_inicial)
     app.run(host="0.0.0.0", port=PORT, threaded=True)
